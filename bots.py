@@ -177,6 +177,9 @@ def _simulate_ibkr(db, groups, rows, data, lines):
     paths = _ibkr_paths(db)
     if not paths:
         return
+    cols = {r[1] for r in db.execute("PRAGMA table_info(picks)")}
+    exp_close = (dict(db.execute("SELECT id, true_exp_close_pct FROM picks WHERE true_exp_close_pct IS NOT NULL"))
+                 if "true_exp_close_pct" in cols else {})
     exits = {
         "sell at the 4 PM bid": dict(),
         f"+{TARGET:.0%} target (bid) else 4 PM bid": dict(target=TARGET),
@@ -193,6 +196,13 @@ def _simulate_ibkr(db, groups, rows, data, lines):
             continue
         data["ibkr"][gname] = {}
         lines.append(f"**{gname}** ({len(picked)} trades)")
+        held = [exp_close[r[0]] for r in picked if exp_close.get(r[0]) is not None]
+        if held:
+            held = np.array(held, dtype=float)
+            data["ibkr"][gname]["hold to expiry (closing bid)"] = {
+                "n": int(len(held)), "avg": float(held.mean()), "win_rate": float((held > 0).mean())}
+            lines.append(f"  hold to expiry, sell at the expiry-day closing bid: {len(held)} trades, "
+                         f"won {(held > 0).mean():.0%}, avg {_pct(float(held.mean()))}")
         for ename, kw in exits.items():
             rets = np.array([_ibkr_exit(*paths[r[0]], **kw) for r in picked], dtype=float)
             stats = {"n": int(len(rets)), "win_rate": float((rets > 0).mean()), "avg": float(rets.mean()),

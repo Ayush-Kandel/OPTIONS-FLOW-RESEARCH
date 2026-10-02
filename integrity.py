@@ -223,6 +223,14 @@ def run_checks(db, now_et, in_session, after_close_expected):
             add("ibkr_greeks_path", FAIL if path_bad else OK,
                 f"{path_bad} minute-by-minute Greeks points with no matching IBKR option trade or impossible values"
                 if path_bad else f"all {n_path} minute-by-minute Greeks points trace to real IBKR trades")
+        handed = _one(db, "SELECT COUNT(*) FROM picks p LEFT JOIN ib_stats s ON s.pick_id = p.id "
+                          "WHERE p.day_stats_status = 'via_ibkr' AND p.trade_date < ? "
+                          "AND COALESCE(s.status, '') NOT IN ('ok', 'no_trades', 'no_bars')",
+                      (now_et.date().isoformat(),))
+        add("ibkr_handoff", WARN if handed else OK,
+            f"{handed} picks were left to IBKR for pricing but IBKR hasn't priced them yet - keep TWS "
+            "logged in (they're lost once the contract expires)" if handed
+            else "every pick handed to IBKR has been priced")
         cols = {r[1] for r in db.execute("PRAGMA table_info(picks)")}
         if "true_source" in cols:
             true_bad = _one(db, "SELECT COUNT(*) FROM picks p LEFT JOIN ib_stats s ON s.pick_id = p.id "

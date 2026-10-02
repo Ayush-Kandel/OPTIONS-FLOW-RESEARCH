@@ -162,6 +162,8 @@ DERIVED_COLUMNS = {
         "max_after_pct": "REAL",
         # honest outcome (what a trader could really get AFTER the print); see update_true_outcomes
         "true_gain_pct": "REAL", "true_loss_pct": "REAL", "true_close_pct": "REAL", "true_source": "TEXT",
+        # expiry day from IBKR: closing bid (what holding to expiry really returned) and best bid
+        "true_exp_close_pct": "REAL", "true_exp_best_pct": "REAL",
     },
     "model_runs": {
         "target": "TEXT", "n_rows": "INTEGER", "base_rate_hit": "REAL", "cv_mae": "REAL",
@@ -402,13 +404,28 @@ def fetch_price_stats(db, call, session_date):
         "OR (exp_stats_status IS NULL AND expiration BETWEEN ? AND ?) "
         "ORDER BY trade_date, trade_time_et",
         (session_date, session_date, cutoff, session_date, cutoff, session_date)).fetchall()
-    counts = {"day": 0, "expiry": 0, "missing": 0, "expired_no_data": 0}
+    counts = {"day": 0, "expiry": 0, "missing": 0, "expired_no_data": 0, "via_ibkr": 0}
     dead = set()   # contracts Trade Echo reported as expired with no bars (don't pay twice)
+    # Contracts still listed are priced free (and honestly, after the print) by IBKR, so Trade
+    # Echo credits are saved for them - but only while TWS is up to actually do it.
+    today = _et().date().isoformat()
+    try:
+        import ibkr
+        ib_up = ibkr.available()
+    except Exception:
+        ib_up = False
     for pid, ticker, tdate, hhmm, strike, pc, exp, fill, need_day, need_exp in rows:
         if not (strike and pc and exp and fill):
             db.execute("UPDATE picks SET day_stats_status = 'no_data', exp_stats_status = "
                        "'no_data' WHERE id = ?", (pid,))
             continue
+        if ib_up and exp >= today and need_day:
+            db.execute("UPDATE picks SET day_stats_status = 'via_ibkr' WHERE id = ?", (pid,))
+            db.commit()
+            counts["via_ibkr"] += 1
+            need_day = False
+            if not need_exp:
+                continue
         symbol = occ_symbol(ticker, exp, pc, strike)
         if symbol in dead:
             _mark_expired_no_data(db, pid, need_day, need_exp)
@@ -467,7 +484,10 @@ def update_true_outcomes(db):
     is known to come after the print. 'te_unconfirmed': the high may predate the print - unused."""
     update_confirmed_gains(db)
     db.execute("UPDATE picks SET true_gain_pct = NULL, true_loss_pct = NULL, true_close_pct = NULL, "
-               "true_source = NULL")
+               "true_source = NULL, true_exp_close_pct = NULL, true_exp_best_pct = NULL")
+    if db.execute("SELECT 1 FROM sqlite_master WHERE name = 'ib_exp_stats'").fetchone():
+        db.execute("UPDATE picks SET true_exp_close_pct = x.bid_close_pct, true_exp_best_pct = x.bid_high_pct "
+                   "FROM ib_exp_stats x WHERE x.pick_id = picks.id AND x.status = 'ok'")
     has_ib = db.execute("SELECT 1 FROM sqlite_master WHERE name = 'ib_stats'").fetchone()
     if has_ib:
         db.execute("UPDATE picks SET true_gain_pct = s.bid_max_gain_pct, true_loss_pct = s.max_loss_pct, "
@@ -1340,6 +1360,7 @@ def run_after_close(db, call, trade_date):
     try:  # honest after-print prices from IBKR BEFORE training (skipped if TWS is closed)
         import ibkr
         ibkr.price_picks(db)
+        ibkr.price_expiries(db)
         ibkr.price_underlyings(db)
         ibkr.refresh_greeks(db)
     except Exception as e:

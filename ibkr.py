@@ -66,6 +66,16 @@ CREATE TABLE IF NOT EXISTS ib_entries (
     bid REAL, ask REAL, last REAL,
     iv REAL, delta REAL, gamma REAL, theta REAL, vega REAL, und_price REAL
 );
+CREATE TABLE IF NOT EXISTS ib_exp_stats (
+    pick_id      INTEGER PRIMARY KEY,
+    status       TEXT NOT NULL,         -- 'ok', 'expired' (gone from IBKR), 'no_bars', 'partial', 'error'
+    detail       TEXT,
+    exp_date     TEXT,
+    n_trade_bars INTEGER, n_bid_bars INTEGER,
+    open REAL, high REAL, low REAL, close REAL, vwap REAL, bid_close REAL, bid_high REAL,
+    high_pct REAL, low_pct REAL, close_pct REAL, vwap_pct REAL, bid_close_pct REAL, bid_high_pct REAL,
+    fetched_utc  TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS ib_stats (
     pick_id          INTEGER PRIMARY KEY,
     status           TEXT NOT NULL,     -- 'ok', 'no_contract', 'no_bars', 'expired', 'error'
@@ -210,7 +220,97 @@ def refresh_greeks(db, log=print):
         f"{n} minute-by-minute Greeks points for {len(paths)} picks")
 
 
-LIVE_CYCLE_SEC = 300      # refresh today's picks every 5 minutes during the session
+EXP_LOOKBACK_DAYS = 4    # try contracts that expired this recently (IBKR drops them soon after)
+
+
+def price_expiries(db, deadline=None, log=print):
+    """Expiry-day stats from IBKR: the full expiry session's 1-minute trades and bids, taken the
+    evening the contract expires (while IBKR still lists it). Replaces Trade Echo's expiry-day
+    stats, which cost credits and vanish for expired contracts."""
+    from ib_async import Option
+    db.executescript(SCHEMA)
+    if not available():
+        log("IBKR: TWS is not accepting API connections - expiry stats skipped")
+        return {}
+    now = datetime.now(ET)
+    last_day = now.date() if now.hour * 60 + now.minute >= 16 * 60 + 5 else now.date() - timedelta(days=1)
+    first = (last_day - timedelta(days=EXP_LOOKBACK_DAYS)).isoformat()
+    todo = db.execute(
+        "SELECT p.id, p.ticker, p.strike, p.put_call, p.expiration, p.trade_date, p.fill_price FROM picks p "
+        "LEFT JOIN ib_exp_stats x ON x.pick_id = p.id WHERE p.expiration BETWEEN ? AND ? "
+        "AND (x.pick_id IS NULL OR x.status IN ('partial', 'error')) ORDER BY p.expiration",
+        (first, last_day.isoformat())).fetchall()
+    if not todo:
+        return {}
+    log(f"IBKR: expiry-day prices for {len(todo)} picks")
+    counts, contracts = {}, {}
+    ib = IbData()
+    try:
+        for pid, ticker, strike, pc, exp, tdate, fill in todo:
+            if deadline and time.time() > deadline or not ib.data_ok():
+                break
+            stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            key = (ticker, strike, pc, exp)
+            try:
+                if exp == tdate and db.execute("SELECT 1 FROM ib_stats WHERE pick_id = ? AND status = 'ok'",
+                                               (pid,)).fetchone():
+                    # 0DTE: the print day IS the expiry day - reuse the bars already stored
+                    q = ("SELECT minute_et, open, high, low, close, volume FROM ib_bars WHERE pick_id = ? "
+                         "AND kind = ? ORDER BY minute_et")
+                    trades = [tuple(r) + (None,) for r in db.execute(q, (pid, "TRADES"))]  # no VWAP stored
+                    bids = [tuple(r) for r in db.execute(q, (pid, "BID"))]
+                else:
+                    if key not in contracts:
+                        c = Option(ticker, exp.replace("-", ""), strike, pc[0], "SMART", currency="USD")
+                        contracts[key] = c if ib.call("qualifyContracts", c) and c.conId else None
+                    c = contracts[key]
+                    if c is None:
+                        db.execute("INSERT OR REPLACE INTO ib_exp_stats (pick_id, status, detail, exp_date, "
+                                   "fetched_utc) VALUES (?, 'expired', 'IBKR no longer lists it', ?, ?)",
+                                   (pid, exp, stamp))
+                        db.commit()
+                        counts["expired"] = counts.get("expired", 0) + 1
+                        continue
+                    trades = _bars(ib, c, date.fromisoformat(exp), "TRADES", with_vwap=True)
+                    bids = _bars(ib, c, date.fromisoformat(exp), "BID")
+                db.executemany("INSERT OR REPLACE INTO ib_bars VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                               [(pid, "EXP_TRADES", *r[:6]) for r in trades]
+                               + [(pid, "EXP_BID", *r[:6]) for r in bids])
+                traded = [r for r in trades if (r[5] or 0) > 0]
+                if not trades or not bids:
+                    st, vals = "partial", {}
+                elif not traded:
+                    st, vals = "no_bars", {}
+                else:
+                    vw_rows = [r for r in traded if len(r) > 6 and r[6]]
+                    vwap = (sum(r[6] * r[5] for r in vw_rows) / sum(r[5] for r in vw_rows)) if vw_rows else None
+                    bid_ok = [r for r in bids if r[2] > 0]
+                    vals = dict(open=traded[0][1], high=max(r[2] for r in traded), low=min(r[3] for r in traded),
+                                close=traded[-1][4], vwap=vwap, bid_close=bids[-1][4],
+                                bid_high=max(r[2] for r in bid_ok) if bid_ok else None)
+                    vals.update({f"{k}_pct": (v / fill - 1 if v is not None else None)
+                                 for k, v in list(vals.items()) if k != "open"})
+                    st = "ok"
+                cols = ["pick_id", "status", "exp_date", "n_trade_bars", "n_bid_bars", "fetched_utc", *vals]
+                db.execute(f"INSERT OR REPLACE INTO ib_exp_stats ({', '.join(cols)}) VALUES "
+                           f"({', '.join('?' * len(cols))})",
+                           (pid, st, exp, len(trades), len(bids), stamp, *vals.values()))
+                db.commit()
+            except NotAllowed:
+                raise
+            except Exception as e:
+                db.execute("INSERT OR REPLACE INTO ib_exp_stats (pick_id, status, detail, exp_date, fetched_utc) "
+                           "VALUES (?, 'error', ?, ?, ?)", (pid, f"{type(e).__name__}: {e}"[:300], exp, stamp))
+                db.commit()
+                st = "error"
+            counts[st] = counts.get(st, 0) + 1
+    finally:
+        ib.close()
+    log(f"IBKR expiry-day prices: {counts}")
+    return counts
+
+
+LIVE_CYCLE_SEC = 300     # refresh today's picks every 5 minutes during the session
 LIVE_MAX_PICKS = 12       # newest picks on your tickers (keeps a cycle inside IBKR's pacing limit)
 LIVE_CLIENT_ID = 18       # separate from the nightly connection
 
