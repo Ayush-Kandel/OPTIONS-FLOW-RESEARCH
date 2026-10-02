@@ -1,0 +1,5 @@
+ib_async>=2.1
+scikit-learn>=1.9
+pandas>=3.0
+numpy>=2.5
+joblib>=1.6

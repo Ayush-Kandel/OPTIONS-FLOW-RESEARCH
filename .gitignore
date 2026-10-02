@@ -1,0 +1,22 @@
+# Data: Trade Echo responses and prices are licensed data, and the DB holds everything
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+
+# Trained models (rebuilt nightly from the data)
+models/
+
+# Logs and runtime state
+*.log
+*.lock
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Secrets never live in files, but just in case
+.env
+*.env
