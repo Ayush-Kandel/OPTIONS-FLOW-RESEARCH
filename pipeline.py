@@ -427,7 +427,9 @@ def fetch_price_stats(db, call, session_date):
             if not need_exp:
                 continue
         symbol = occ_symbol(ticker, exp, pc, strike)
-        if symbol in dead:
+        # Trade Echo returns no bars for contracts that expired before today (0 of 56 tried on
+        # Oct 2, at 2 credits each), so don't pay to ask
+        if symbol in dead or exp < today:
             _mark_expired_no_data(db, pid, need_day, need_exp)
             counts["expired_no_data"] += 1
             continue
