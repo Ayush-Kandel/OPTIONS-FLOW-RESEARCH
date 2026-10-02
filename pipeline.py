@@ -369,6 +369,20 @@ def _save_exp(db, pid, fill, bar):
          _pct(bar.get("c"), fill), pid))
 
 
+def _says_expired(payload):
+    data = payload.get("data") if isinstance(payload, dict) else None
+    inner = data.get("data") if isinstance(data, dict) else None
+    return isinstance(inner, dict) and inner.get("expired") is True
+
+
+def _mark_expired_no_data(db, pid, need_day, need_exp):
+    if need_day:
+        db.execute("UPDATE picks SET day_stats_status = 'no_data' WHERE id = ?", (pid,))
+    if need_exp:
+        db.execute("UPDATE picks SET exp_stats_status = 'no_data' WHERE id = ?", (pid,))
+    db.commit()
+
+
 def fetch_price_stats(db, call, session_date):
     """Fill print-day and expiry-day price stats for every pick that still needs them and is
     within Trade Echo's price history. One market-data call (2 credits) covers both days."""
@@ -388,15 +402,29 @@ def fetch_price_stats(db, call, session_date):
         "OR (exp_stats_status IS NULL AND expiration BETWEEN ? AND ?) "
         "ORDER BY trade_date, trade_time_et",
         (session_date, session_date, cutoff, session_date, cutoff, session_date)).fetchall()
-    counts = {"day": 0, "expiry": 0, "missing": 0}
+    counts = {"day": 0, "expiry": 0, "missing": 0, "expired_no_data": 0}
+    dead = set()   # contracts Trade Echo reported as expired with no bars (don't pay twice)
     for pid, ticker, tdate, hhmm, strike, pc, exp, fill, need_day, need_exp in rows:
         if not (strike and pc and exp and fill):
             db.execute("UPDATE picks SET day_stats_status = 'no_data', exp_stats_status = "
                        "'no_data' WHERE id = ?", (pid,))
             continue
-        payload = call("get_market_data", {"ticker": occ_symbol(ticker, exp, pc, strike),
-                                           "endpoint_type": "aggregates"}, "market_data", ticker)
+        symbol = occ_symbol(ticker, exp, pc, strike)
+        if symbol in dead:
+            _mark_expired_no_data(db, pid, need_day, need_exp)
+            counts["expired_no_data"] += 1
+            continue
+        payload = call("get_market_data", {"ticker": symbol, "endpoint_type": "aggregates"},
+                       "market_data", ticker)
         bars = _bars_by_date(payload)
+        if not bars and _says_expired(payload):
+            # Trade Echo keeps no bars for this expired contract any more: a retry would cost 2
+            # credits for nothing. IBKR prices are the honest outcome anyway.
+            dead.add(symbol)
+            _mark_expired_no_data(db, pid, need_day, need_exp)
+            counts["expired_no_data"] += 1
+            print(f"  prices {ticker} {strike:g}{pc[0]} {exp}: expired, Trade Echo has no bars - skipped for good")
+            continue
         parts = []
         if need_day:
             if tdate in bars:
