@@ -66,6 +66,19 @@ CREATE TABLE IF NOT EXISTS ib_entries (
     bid REAL, ask REAL, last REAL,
     iv REAL, delta REAL, gamma REAL, theta REAL, vega REAL, und_price REAL
 );
+CREATE TABLE IF NOT EXISTS ib_contract_bars (   -- every session from the print day to expiry
+    ticker TEXT NOT NULL, strike REAL NOT NULL, put_call TEXT NOT NULL, expiration TEXT NOT NULL,
+    kind      TEXT NOT NULL,            -- 'TRADES' or 'BID'
+    minute_et TEXT NOT NULL,
+    open REAL, high REAL, low REAL, close REAL, volume REAL,
+    PRIMARY KEY (ticker, strike, put_call, expiration, kind, minute_et)
+);
+CREATE TABLE IF NOT EXISTS ib_live_quotes (     -- streamed during market hours, one row per minute
+    ticker TEXT NOT NULL, strike REAL NOT NULL, put_call TEXT NOT NULL, expiration TEXT NOT NULL,
+    minute_et TEXT NOT NULL,
+    bid REAL, ask REAL, last REAL, volume REAL, iv REAL, delta REAL, und_price REAL,
+    PRIMARY KEY (ticker, strike, put_call, expiration, minute_et)
+);
 CREATE TABLE IF NOT EXISTS ib_oi (
     ticker TEXT NOT NULL, strike REAL NOT NULL, put_call TEXT NOT NULL, expiration TEXT NOT NULL,
     snap_date     TEXT NOT NULL,        -- ET date of the snapshot (OI = as of the previous close)
@@ -177,7 +190,9 @@ class IbData:
         return getattr(self._ib, method)(*args, **kwargs)
 
     def _on_notice(self, req_id, code, msg, contract=None):
-        if code in (354, 10091, 10089, 10090):  # market data not subscribed (delayed only)
+        # 354 = not subscribed at all. (10091 "part of the data needs another subscription" is about
+        # the underlying stock's feed - the option's own bid/ask still arrive, so it isn't counted.)
+        if code in (354, 10089, 10090):
             self.no_subscription = True
         if code == 1100:
             self._link_ok = False
@@ -279,8 +294,130 @@ def price_spreads(db, deadline=None, log=print):
     return {"spreads": done}
 
 
-OI_WAIT_SEC = 8       # IBKR usually sends open interest within a second or two
-OI_BATCH = 40         # contracts requested at once (well under the 100 market-data lines)
+HOLD_MAX_DAYS = 5   # one IBKR request returns up to 5 sessions of 1-minute bars
+
+
+def price_holding_days(db, deadline=None, log=print):
+    """Every session's 1-minute trades and bids for each pick contract still listed, from the day
+    after its first print through the last finished session (the days between print and expiry).
+    Stored once per contract, shared by all picks on it."""
+    from ib_async import Option
+    ensure_schema(db)
+    if not available():
+        log("IBKR: TWS is not accepting API connections - holding days skipped")
+        return {}
+    now = datetime.now(ET)
+    last_day = now.date() if now.hour * 60 + now.minute >= 16 * 60 + 5 else now.date() - timedelta(days=1)
+    contracts = db.execute(
+        "SELECT ticker, strike, put_call, expiration, MIN(trade_date) FROM picks WHERE expiration >= ? "
+        "GROUP BY ticker, strike, put_call, expiration", (last_day.isoformat(),)).fetchall()
+    todo = []
+    for tk, k, pc, exp, first in contracts:
+        have = db.execute("SELECT MAX(substr(minute_et, 1, 10)) FROM ib_contract_bars WHERE ticker = ? "
+                          "AND strike = ? AND put_call = ? AND expiration = ? AND kind = 'BID'",
+                          (tk, k, pc, exp)).fetchone()[0]
+        start = max(first, have) if have else first
+        if start < last_day.isoformat():
+            todo.append((tk, k, pc, exp, start))
+    if not todo:
+        return {}
+    log(f"IBKR: holding-day prices for {len(todo)} contracts (~{len(todo) * 2 * HIST_GAP_SEC / 60:.0f} min)")
+    n = 0
+    ib = IbData()
+    try:
+        for tk, k, pc, exp, start in todo:
+            if deadline and time.time() > deadline or not ib.data_ok():
+                log(f"IBKR: holding days stopped at {n}/{len(todo)} - the rest continues next run")
+                break
+            c = Option(tk, exp.replace("-", ""), k, pc[0], "SMART", currency="USD")
+            if not (ib.call("qualifyContracts", c) and c.conId):
+                continue
+            days = min(HOLD_MAX_DAYS, max(1, (last_day - date.fromisoformat(start)).days + 1))
+            end = datetime.combine(last_day, datetime.min.time(), ET).replace(hour=16, minute=5)
+            for kind in ("TRADES", "BID"):
+                bars = ib.call("reqHistoricalData", c, endDateTime=end.astimezone(timezone.utc).strftime("%Y%m%d-%H:%M:%S"),
+                               durationStr=f"{days} D", barSizeSetting="1 min", whatToShow=kind, useRTH=True, formatDate=2)
+                rows = []
+                for b in bars or []:
+                    t = b.date if isinstance(b.date, datetime) else datetime.fromtimestamp(int(b.date), timezone.utc)
+                    m = t.astimezone(ET).strftime("%Y-%m-%d %H:%M")
+                    if m[:10] > start:   # sessions AFTER the print day (the print day itself is in ib_bars)
+                        rows.append((tk, k, pc, exp, kind, m, b.open, b.high, b.low, b.close, b.volume))
+                db.executemany("INSERT OR REPLACE INTO ib_contract_bars VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
+                db.commit()
+            n += 1
+    finally:
+        ib.close()
+    log(f"IBKR: holding-day prices recorded for {n} contracts")
+    return {"holding_days": n}
+
+
+LIVE_STREAM_MAX = 70     # contracts streamed live at once; + OI batch (20) + entry quote stays under
+                         # IBKR's 100 market-data lines
+
+
+class LiveQuotes:
+    """Streams live bid/ask/last for the most important open pick contracts during market hours
+    (OPRA) and saves the latest values once a minute. Priority: pinged contracts, then your
+    tickers' newest picks, then everything else still listed."""
+
+    def __init__(self, db, ib, my_tickers):
+        self.db, self.ib, self.my = db, ib, set(my_tickers)
+        self.streams, self.last_minute = {}, None
+
+    def refresh(self):
+        from ib_async import Option
+        today = datetime.now(ET).date().isoformat()
+        marks = ",".join("?" * len(self.my))
+        wanted = [tuple(r[:4]) for r in self.db.execute(
+            f"SELECT ticker, strike, put_call, expiration, MAX(pinged_utc IS NOT NULL) AS pinged, "
+            f"MAX(ticker IN ({marks})) AS mine, MAX(trade_date || trade_time_et) AS latest FROM picks "
+            f"WHERE expiration >= ? GROUP BY ticker, strike, put_call, expiration "
+            f"ORDER BY pinged DESC, mine DESC, latest DESC LIMIT ?",
+            (*sorted(self.my), today, LIVE_STREAM_MAX))]
+        for key in [k for k in self.streams if k not in wanted]:
+            self.ib.call("cancelMktData", self.streams.pop(key)[0])
+        new = [k for k in wanted if k not in self.streams]
+        if new:
+            self.ib.call("reqMarketDataType", 1)
+        for key in new:
+            tk, k, pc, exp = key
+            c = Option(tk, exp.replace("-", ""), k, pc[0], "SMART", currency="USD")
+            if self.ib.call("qualifyContracts", c) and c.conId:
+                self.streams[key] = (c, self.ib.call("reqMktData", c, "100,106", False, False))
+        return len(self.streams)
+
+    def record(self):
+        """Once per minute: save each stream's latest values under the minute that just ended."""
+        now = datetime.now(ET)
+        minute = (now - timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M")
+        if minute == self.last_minute or not self.streams:
+            return 0
+        self.last_minute = minute
+        rows = []
+        for key, (c, t) in self.streams.items():
+            g = t.modelGreeks
+            bid, ask, last = _num(t.bid), _num(t.ask), _num(t.last)
+            if (bid or 0) <= 0 and (ask or 0) <= 0 and not last:
+                continue
+            rows.append((*key, minute, bid if bid and bid > 0 else None, ask if ask and ask > 0 else None, last,
+                         _num(t.volume), _num(g.impliedVol) if g else None, _num(g.delta) if g else None,
+                         _num(g.undPrice) if g else None))
+        self.db.executemany("INSERT OR REPLACE INTO ib_live_quotes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
+        self.db.commit()
+        return len(rows)
+
+    def close(self):
+        for c, _ in self.streams.values():
+            try:
+                self.ib.call("cancelMktData", c)
+            except Exception:
+                pass
+        self.streams = {}
+
+
+OI_WAIT_SEC = 8      # IBKR usually sends open interest within a second or two
+OI_BATCH = 20         # contracts requested at once (live streams use most of the 100 lines)
 
 
 def _snapshot_oi_batch(db, ib, items, snap_date):
@@ -534,7 +671,7 @@ def record_entries(db, ib, contracts, log=print):
                        gamma=_num(g.gamma) if g else None, theta=_num(g.theta) if g else None,
                        vega=_num(g.vega) if g else None, und_price=_num(g.undPrice) if g else None,
                        open_interest=_num(t.callOpenInterest if pc == "CALL" else t.putOpenInterest))
-            live = (row["bid"] or 0) > 0 and (row["ask"] or 0) > 0 and t.marketDataType == 1
+            live = (row["bid"] or 0) > 0 and (row["ask"] or 0) > 0 and t.marketDataType in (1, 2)
             row["status"] = "ok" if live else ("no_subscription" if ib.no_subscription else "no_quote")
         cols = list(row)
         db.execute(f"INSERT OR REPLACE INTO ib_entries ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
@@ -557,26 +694,38 @@ def run_live(db, in_session, next_open, my_tickers, log=print):
     ib, contracts = None, {}
     busy = {"entries": False}
     oi_day = {"date": None}
+    live = {"quotes": None}
 
     def entries_hook():
+        """Runs every few seconds: entry quotes for new pings, then the once-a-minute live save."""
         if busy["entries"] or ib is None:
             return
         busy["entries"] = True
         try:
             record_entries(db, ib, contracts, log)
+            if live["quotes"]:
+                live["quotes"].record()
         except NotAllowed:
             raise
         except Exception as e:
-            log(f"{datetime.now(ET):%H:%M:%S} IBKR entry check failed: {type(e).__name__}: {e}")
+            log(f"{datetime.now(ET):%H:%M:%S} IBKR entry/live check failed: {type(e).__name__}: {e}")
         finally:
             busy["entries"] = False
+
+    def drop_connection():
+        nonlocal ib, contracts
+        if live["quotes"]:
+            live["quotes"].close()
+            live["quotes"] = None
+        if ib:
+            ib.close()
+        ib, contracts = None, {}
 
     while True:
         now = datetime.now(ET)
         if not in_session(now):
             if ib:
-                ib.close()
-                ib, contracts = None, {}
+                drop_connection()
             nxt = next_open(now)
             log(f"{now:%H:%M:%S} IBKR live: market closed, next session {nxt:%a %H:%M} ET")
             time.sleep(max(60, (nxt - datetime.now(ET)).total_seconds() + 60))
@@ -584,15 +733,16 @@ def run_live(db, in_session, next_open, my_tickers, log=print):
         started = time.time()
         try:
             if ib is None or not ib.data_ok():
-                if ib:
-                    ib.close()
+                drop_connection()
                 if not available():
                     log(f"{now:%H:%M:%S} IBKR live: TWS not open - retrying in 5 min")
                     time.sleep(LIVE_CYCLE_SEC)
                     continue
                 ib, contracts = IbData(), {}
                 ib.idle_hook = entries_hook
+                live["quotes"] = LiveQuotes(db, ib, my_tickers)
             entries_hook()
+            n_streams = live["quotes"].refresh()   # stream every open pick contract (pinged first)
             if oi_day["date"] != now.date():   # once per session: OI of every listed pick contract
                 snapshot_open_interest(db, ib, log=log)
                 oi_day["date"] = now.date()
@@ -618,15 +768,13 @@ def run_live(db, in_session, next_open, my_tickers, log=print):
                 if contracts[key]:
                     _store_today(db, ib, contracts[key], "TRADES", pick_id=pid)
                     points += greeks_path(db, pid)
-            log(f"{datetime.now(ET):%H:%M:%S} IBKR live: {len(picks)} picks updated, {points} Greeks points "
-                f"({time.time() - started:.0f}s)")
+            log(f"{datetime.now(ET):%H:%M:%S} IBKR live: {n_streams} contracts streaming, {len(picks)} picks' "
+                f"bars updated, {points} Greeks points ({time.time() - started:.0f}s)")
         except NotAllowed:
             raise
         except Exception as e:
             log(f"{datetime.now(ET):%H:%M:%S} IBKR live: cycle failed: {type(e).__name__}: {e}")
-            if ib:
-                ib.close()
-            ib, contracts = None, {}
+            drop_connection()
         # until the next cycle, keep checking for new pings every few seconds
         while time.time() - started < LIVE_CYCLE_SEC:
             if ib is not None and ib.data_ok():

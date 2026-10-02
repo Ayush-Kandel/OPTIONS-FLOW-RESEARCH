@@ -905,6 +905,7 @@ def run_ibkr(db):
         deadline = next_open_et(now_et(), skip_today=now_et().time() >= SESSION_OPEN).timestamp() - 15 * 60
         ibkr.price_picks(db, deadline=deadline)
         ibkr.price_expiries(db, deadline=deadline)
+        ibkr.price_holding_days(db, deadline=deadline)
         ibkr.price_spreads(db, deadline=deadline)
         ibkr.price_stock_iv(db, deadline=deadline)
         ibkr.price_underlyings(db, deadline=deadline)
