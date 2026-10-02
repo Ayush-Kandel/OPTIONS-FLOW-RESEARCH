@@ -79,6 +79,10 @@ CREATE TABLE IF NOT EXISTS ib_live_quotes (     -- streamed during market hours,
     bid REAL, ask REAL, last REAL, volume REAL, iv REAL, delta REAL, und_price REAL,
     PRIMARY KEY (ticker, strike, put_call, expiration, minute_et)
 );
+CREATE TABLE IF NOT EXISTS ib_ping_alerts (     -- live Discord follow-ups already sent
+    pick_id INTEGER NOT NULL, level TEXT NOT NULL, sent_utc TEXT NOT NULL,
+    PRIMARY KEY (pick_id, level)
+);
 CREATE TABLE IF NOT EXISTS ib_oi (
     ticker TEXT NOT NULL, strike REAL NOT NULL, put_call TEXT NOT NULL, expiration TEXT NOT NULL,
     snap_date     TEXT NOT NULL,        -- ET date of the snapshot (OI = as of the previous close)
@@ -416,7 +420,64 @@ class LiveQuotes:
         self.streams = {}
 
 
-OI_WAIT_SEC = 8      # IBKR usually sends open interest within a second or two
+ALERT_LEVELS = [(1.00, "+100%"), (0.50, "+50%"), (0.30, "+30%"), (-0.50, "-50%")]
+SUMMARY_EVERY_MIN = 15
+
+
+def ping_values(db):
+    """Today's pings: entry (your ask right after the ping, else the whale's fill), the latest
+    streamed bid (what you could sell at now) and the best bid since entry."""
+    today = datetime.now(ET).date().isoformat()
+    out = []
+    for pid, t, tk, k, pc, exp, fill, ask, emin in db.execute(
+            "SELECT p.id, p.trade_time_et, p.ticker, p.strike, p.put_call, p.expiration, p.fill_price, e.ask, "
+            "e.minute_et FROM picks p LEFT JOIN ib_entries e ON e.pick_id = p.id AND e.status = 'ok' "
+            "WHERE p.trade_date = ? AND p.pinged_utc IS NOT NULL ORDER BY p.trade_time_et", (today,)).fetchall():
+        entry = ask or fill
+        q = db.execute("SELECT minute_et, bid FROM ib_live_quotes WHERE ticker = ? AND strike = ? AND put_call = ? "
+                       "AND expiration = ? AND minute_et >= ? AND bid > 0 ORDER BY minute_et",
+                       (tk, k, pc, exp, emin or f"{today} {t}")).fetchall()
+        out.append(dict(pid=pid, time=t, name=f"{tk} ${k:g} {'CALL' if pc == 'CALL' else 'PUT'} {exp}", entry=entry,
+                        from_fill=ask is None, bid=q[-1][1] if q else None, at=q[-1][0][11:] if q else None,
+                        best=max(r[1] for r in q) if q else None))
+    return out
+
+
+def ping_updates(db, state, log=print):
+    """Discord follow-ups on today's pings (Herald channel): an alert the first time a ping's bid
+    crosses +30/+50/+100% or -50% from your entry, and a summary of all open pings every 15 min."""
+    import pipeline as pl
+    vals = [v for v in ping_values(db) if v["bid"]]
+    now = datetime.now(timezone.utc)
+    for v in vals:
+        pnl = v["bid"] / v["entry"] - 1
+        for level, label in ALERT_LEVELS:
+            hit = pnl >= level if level > 0 else pnl <= level
+            if hit and not db.execute("SELECT 1 FROM ib_ping_alerts WHERE pick_id = ? AND level = ?",
+                                      (v["pid"], label)).fetchone():
+                # mark every lower level as sent too, so a jump straight to +100% posts once
+                for lv, lb in ALERT_LEVELS:
+                    if (lv > 0 and level > 0 and lv <= level) or lb == label:
+                        db.execute("INSERT OR IGNORE INTO ib_ping_alerts VALUES (?, ?, ?)",
+                                   (v["pid"], lb, now.isoformat(timespec="seconds")))
+                db.commit()
+                icon = "🚀" if level > 0 else "🔻"
+                pl.discord_send(f"{icon} **{v['name']}** is **{pnl:+.0%}** from entry: bid ${v['bid']:.2f} vs "
+                                f"entry ${v['entry']:.2f}{' (whale fill)' if v['from_fill'] else ' (ask at ping)'}, "
+                                f"pinged {v['time']} ET. _Live IBKR quote, not advice._")
+                log(f"{datetime.now(ET):%H:%M:%S} alert {v['name']} {label} ({pnl:+.0%})")
+                break
+    if vals and (state.get("summary") is None or (now - state["summary"]).total_seconds() >= SUMMARY_EVERY_MIN * 60):
+        state["summary"] = now
+        lines = [f"📡 **Live ping tracker - {datetime.now(ET):%H:%M} ET** (sell price = live bid)"]
+        for v in vals:
+            lines.append(f"{'🟢' if v['bid'] >= v['entry'] else '🔴'} {v['name']}: entry ${v['entry']:.2f} -> "
+                         f"bid ${v['bid']:.2f} (**{v['bid'] / v['entry'] - 1:+.0%}**), best "
+                         f"{v['best'] / v['entry'] - 1:+.0%}")
+        pl.discord_send("\n".join(lines))
+
+
+OI_WAIT_SEC = 8     # IBKR usually sends open interest within a second or two
 OI_BATCH = 20         # contracts requested at once (live streams use most of the 100 lines)
 
 
@@ -680,6 +741,7 @@ def record_entries(db, ib, contracts, log=print):
         log(f"{datetime.now(ET):%H:%M:%S} IBKR entry {ticker} {strike:g}{pc[0]} {exp}: {row['status']}"
             + (f" bid {row['bid']} / ask {row['ask']} ({row['delay_sec']:.0f}s after the ping)"
                if row["status"] == "ok" else ""))
+    return len(todo)
 
 
 def run_live(db, in_session, next_open, my_tickers, log=print):
@@ -695,6 +757,7 @@ def run_live(db, in_session, next_open, my_tickers, log=print):
     busy = {"entries": False}
     oi_day = {"date": None}
     live = {"quotes": None}
+    alerts = {"summary": None}
 
     def entries_hook():
         """Runs every few seconds: entry quotes for new pings, then the once-a-minute live save."""
@@ -702,9 +765,12 @@ def run_live(db, in_session, next_open, my_tickers, log=print):
             return
         busy["entries"] = True
         try:
-            record_entries(db, ib, contracts, log)
+            new_pings = record_entries(db, ib, contracts, log)
             if live["quotes"]:
-                live["quotes"].record()
+                if new_pings:             # stream a newly pinged contract right away
+                    live["quotes"].refresh()
+                if live["quotes"].record():   # a new minute was saved -> check follow-ups
+                    ping_updates(db, alerts, log)
         except NotAllowed:
             raise
         except Exception as e:
