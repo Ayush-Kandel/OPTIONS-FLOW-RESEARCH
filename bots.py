@@ -126,7 +126,8 @@ def _ibkr_paths(db):
                "LEFT JOIN ib_entries e ON e.pick_id = p.id AND e.status = 'ok' "
                if has_entries else "NULL, NULL FROM ib_stats s JOIN picks p ON p.id = s.pick_id ")
             + "WHERE s.status = 'ok' AND s.n_bid_bars > 0"):
-        price, start = (ask, entry_min) if ask else (fill, f"{tdate} {hhmm}")
+        use_ask = ask and getattr(__import__("ibkr"), "ENTRY_MODE", "whale") == "ask"
+        price, start = (ask, entry_min) if use_ask else (fill, f"{tdate} {hhmm}")
         bars = db.execute("SELECT high, low, close FROM ib_bars WHERE pick_id = ? AND kind = 'BID' "
                           "AND minute_et > ? AND high > 0 ORDER BY minute_et", (pid, start)).fetchall()
         if bars:

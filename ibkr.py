@@ -422,17 +422,22 @@ class LiveQuotes:
 
 ALERT_LEVELS = [(1.00, "+100%"), (0.50, "+50%"), (0.30, "+30%"), (-0.50, "-50%")]
 SUMMARY_EVERY_MIN = 15
+# Entry used for live tracking and backtests: "whale" = the whale's fill at the print time (for now,
+# while latency is worked on); "ask" = your real ask right after the ping (still recorded either way)
+ENTRY_MODE = "whale"
 
 
 def ping_values(db):
-    """Today's pings: entry (your ask right after the ping, else the whale's fill), the latest
-    streamed bid (what you could sell at now) and the best bid since entry."""
+    """Today's pings: entry (the whale's fill at the print time, or your ask after the ping when
+    ENTRY_MODE = 'ask'), the latest streamed bid (what you could sell at now) and the best bid since."""
     today = datetime.now(ET).date().isoformat()
     out = []
     for pid, t, tk, k, pc, exp, fill, ask, emin in db.execute(
             "SELECT p.id, p.trade_time_et, p.ticker, p.strike, p.put_call, p.expiration, p.fill_price, e.ask, "
             "e.minute_et FROM picks p LEFT JOIN ib_entries e ON e.pick_id = p.id AND e.status = 'ok' "
             "WHERE p.trade_date = ? AND p.pinged_utc IS NOT NULL ORDER BY p.trade_time_et", (today,)).fetchall():
+        if ENTRY_MODE != "ask":
+            ask = emin = None
         entry = ask or fill
         q = db.execute("SELECT minute_et, bid FROM ib_live_quotes WHERE ticker = ? AND strike = ? AND put_call = ? "
                        "AND expiration = ? AND minute_et >= ? AND bid > 0 ORDER BY minute_et",
@@ -462,16 +467,19 @@ def ping_updates(db, state, log=print):
                                    (v["pid"], lb, now.isoformat(timespec="seconds")))
                 db.commit()
                 icon = "🚀" if level > 0 else "🔻"
-                pl.discord_send(f"{icon} **{v['name']}** is **{pnl:+.0%}** from entry: bid ${v['bid']:.2f} vs "
-                                f"entry ${v['entry']:.2f}{' (whale fill)' if v['from_fill'] else ' (ask at ping)'}, "
-                                f"pinged {v['time']} ET. _Live IBKR quote, not advice._")
+                src = f"whale's fill at {v['time']} ET" if v["from_fill"] else "your ask at the ping"
+                pl.discord_send(f"{icon} **{v['name']}** is **{pnl:+.0%}**: bid ${v['bid']:.2f} vs "
+                                f"${v['entry']:.2f} ({src}). _Live IBKR quote, not advice._")
                 log(f"{datetime.now(ET):%H:%M:%S} alert {v['name']} {label} ({pnl:+.0%})")
                 break
     if vals and (state.get("summary") is None or (now - state["summary"]).total_seconds() >= SUMMARY_EVERY_MIN * 60):
         state["summary"] = now
-        lines = [f"📡 **Live ping tracker - {datetime.now(ET):%H:%M} ET** (sell price = live bid)"]
+        lines = [f"📡 **Live ping tracker - {datetime.now(ET):%H:%M} ET** (from the whale's fill at the print "
+                 "time; sell price = live bid)" if ENTRY_MODE != "ask" else
+                 f"📡 **Live ping tracker - {datetime.now(ET):%H:%M} ET** (from your ask at the ping; sell = bid)"]
         for v in vals:
-            lines.append(f"{'🟢' if v['bid'] >= v['entry'] else '🔴'} {v['name']}: entry ${v['entry']:.2f} -> "
+            lines.append(f"{'🟢' if v['bid'] >= v['entry'] else '🔴'} {v['name']} ({v['time']}): "
+                         f"fill ${v['entry']:.2f} -> "
                          f"bid ${v['bid']:.2f} (**{v['bid'] / v['entry'] - 1:+.0%}**), best "
                          f"{v['best'] / v['entry'] - 1:+.0%}")
         pl.discord_send("\n".join(lines))
