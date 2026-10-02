@@ -79,7 +79,10 @@ FEATURES = ["score", "log_premium", "log_fill", "dte", "hours_to_expiry", "is_ca
             "repeat_30m", "flow_call_share_30m", "hermes_est", "qwen_est", "is_my_ticker", "from_algo",
             # market context from IBKR 1-minute stock bars, BEFORE the print minute only; "with"
             # = signed in the trade's direction (stock up helps a call, down helps a put)
-            "stock_with_30m", "stock_with_day", "stock_range_30m", "spy_with_30m", "spy_with_day"]
+            "stock_with_30m", "stock_with_day", "stock_range_30m", "spy_with_30m", "spy_with_day",
+            # stock implied volatility (IBKR, previous close only): level, 1-year rank, and how
+            # expensive this contract is vs the stock's normal IV
+            "stock_iv_prev", "stock_iv_rank_1y", "iv_vs_stock_iv"]
 CONTEXT_MAX_STALE_MIN = 10       # latest bar must be this close to the print, else no context
 
 SCHEMA = """
@@ -668,7 +671,24 @@ def features_for(db, pick_id):
     f["stock_range_30m"] = srange
     f["spy_with_30m"] = None if p30 is None else sign * p30
     f["spy_with_day"] = None if pday is None else sign * pday
+    f["stock_iv_prev"], f["stock_iv_rank_1y"] = _stock_iv(db, ticker, trade_date)
+    f["iv_vs_stock_iv"] = iv / f["stock_iv_prev"] if iv and f["stock_iv_prev"] else None
     return f, spot
+
+
+def _stock_iv(db, ticker, trade_date):
+    """(IV at the last close BEFORE the trade date, its percentile rank over the prior year)."""
+    try:
+        rows = [r[0] for r in db.execute(
+            "SELECT iv FROM ib_stock_iv WHERE ticker = ? AND day < ? AND day >= date(?, '-1 year') ORDER BY day",
+            (ticker, trade_date, trade_date))]
+    except sqlite3.OperationalError:
+        return None, None
+    if not rows:
+        return None, None
+    last = rows[-1]
+    rank = sum(1 for v in rows if v <= last) / len(rows) if len(rows) >= 60 else None
+    return last, rank
 
 
 def _stock_context(db, ticker, trade_date, hhmm):
@@ -695,9 +715,11 @@ def _stock_context(db, ticker, trade_date, hhmm):
     return last / ref30 - 1, last / rows[0][1] - 1, rng
 
 
-def _frame(db, ids):
+def _frame(db, ids, columns=None):
+    """Feature table; `columns` = a saved model's own input list, so a model trained before new
+    inputs were added still scores live picks until the next retrain."""
     import pandas as pd
-    return pd.DataFrame([features_for(db, i)[0] for i in ids], columns=FEATURES, dtype="float64")
+    return pd.DataFrame([features_for(db, i)[0] for i in ids], columns=columns or FEATURES, dtype="float64")
 
 
 # ----------------------------------------------------------------- model --
@@ -919,15 +941,16 @@ def score_pick(db, pick_id):
     bundle = _load_model()
     if bundle is None:
         return None
-    if bundle.get("features", FEATURES) != FEATURES and bundle.get("estimator") is not None:
-        print(f"Model {bundle.get('version')} was trained on different inputs - not scoring; it is "
+    cols = bundle.get("features", FEATURES)
+    if set(cols) - set(FEATURES) and bundle.get("estimator") is not None:
+        print(f"Model {bundle.get('version')} uses inputs that no longer exist - not scoring; it is "
               "replaced at the next nightly retrain (or run: py flow_logger.py --train)")
         return None
     import numpy as np
     h, q = db.execute("SELECT hermes_expected_gain, qwen_expected_gain FROM picks WHERE id = ?",
                       (pick_id,)).fetchone()
     llm = {"hermes": np.array([np.nan if h is None else h]), "qwen": np.array([np.nan if q is None else q])}
-    pred = float(_predict_with(bundle["kind"], bundle["estimator"], _frame(db, [pick_id]), llm,
+    pred = float(_predict_with(bundle["kind"], bundle["estimator"], _frame(db, [pick_id], cols), llm,
                                bundle["hermes_fill"])[0])
     db.execute("UPDATE picks SET pred_max_gain = ?, model_version = ? WHERE id = ?",
                (pred, bundle["version"], pick_id))
@@ -1364,6 +1387,7 @@ def run_after_close(db, call, trade_date):
         ibkr.price_picks(db)
         ibkr.price_expiries(db)
         ibkr.price_underlyings(db)
+        ibkr.price_stock_iv(db)
         ibkr.refresh_greeks(db)
     except Exception as e:
         print(f"IBKR pricing failed: {type(e).__name__}: {e} - training on what's there")

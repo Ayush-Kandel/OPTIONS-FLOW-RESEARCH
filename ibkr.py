@@ -66,6 +66,19 @@ CREATE TABLE IF NOT EXISTS ib_entries (
     bid REAL, ask REAL, last REAL,
     iv REAL, delta REAL, gamma REAL, theta REAL, vega REAL, und_price REAL
 );
+CREATE TABLE IF NOT EXISTS ib_oi (
+    ticker TEXT NOT NULL, strike REAL NOT NULL, put_call TEXT NOT NULL, expiration TEXT NOT NULL,
+    snap_date     TEXT NOT NULL,        -- ET date of the snapshot (OI = as of the previous close)
+    open_interest REAL,
+    at_utc        TEXT NOT NULL,
+    PRIMARY KEY (ticker, strike, put_call, expiration, snap_date)
+);
+CREATE TABLE IF NOT EXISTS ib_stock_iv (
+    ticker TEXT NOT NULL,
+    day    TEXT NOT NULL,               -- trading day
+    iv     REAL,                        -- IBKR's 30-day implied volatility of the stock, at that day's close
+    PRIMARY KEY (ticker, day)
+);
 CREATE TABLE IF NOT EXISTS ib_exp_stats (
     pick_id      INTEGER PRIMARY KEY,
     status       TEXT NOT NULL,         -- 'ok', 'expired' (gone from IBKR), 'no_bars', 'partial', 'error'
@@ -98,6 +111,23 @@ CREATE TABLE IF NOT EXISTS ib_stats (
     fetched_utc      TEXT NOT NULL
 );
 """
+
+
+EXTRA_COLUMNS = {
+    "ib_stats": {"n_ask_bars": "INTEGER", "spread_at_print": "REAL", "spread_pct_at_print": "REAL",
+                 "median_spread_pct": "REAL"},
+    "ib_entries": {"open_interest": "REAL"},
+}
+
+
+def ensure_schema(db):
+    db.executescript(SCHEMA)
+    for table, cols in EXTRA_COLUMNS.items():
+        have = {r[1] for r in db.execute(f"PRAGMA table_info({table})")}
+        for name, kind in cols.items():
+            if name not in have:
+                db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {kind}")
+    db.commit()
 
 
 class NotAllowed(RuntimeError):
@@ -206,7 +236,7 @@ def refresh_greeks(db, log=print):
     """Recompute print-time Greeks with IBKR's exact print-minute stock price (all picks that have
     it) and the minute-by-minute Greeks paths (picks with IBKR option bars). No API calls."""
     import pipeline as pl
-    db.executescript(SCHEMA)
+    ensure_schema(db)
     ids = [r[0] for r in db.execute(
         "SELECT DISTINCT p.id FROM picks p JOIN ib_stock_bars s ON s.ticker = p.ticker "
         "AND s.minute_et = p.trade_date || ' ' || p.trade_time_et WHERE p.source != 'algo' "
@@ -220,7 +250,136 @@ def refresh_greeks(db, log=print):
         f"{n} minute-by-minute Greeks points for {len(paths)} picks")
 
 
-EXP_LOOKBACK_DAYS = 4    # try contracts that expired this recently (IBKR drops them soon after)
+def price_spreads(db, deadline=None, log=print):
+    """Backfill the ask side (spread) for IBKR-priced picks whose contract is still listed."""
+    from ib_async import Option
+    ensure_schema(db)
+    if not available():
+        return {}
+    today = datetime.now(ET).date().isoformat()
+    todo = db.execute("SELECT p.id, p.ticker, p.strike, p.put_call, p.expiration, p.trade_date, p.trade_time_et "
+                      "FROM ib_stats s JOIN picks p ON p.id = s.pick_id WHERE s.status = 'ok' "
+                      "AND s.n_ask_bars IS NULL AND p.expiration >= ? ORDER BY p.trade_date", (today,)).fetchall()
+    if not todo:
+        return {}
+    log(f"IBKR: bid/ask spreads for {len(todo)} picks (~{len(todo) * HIST_GAP_SEC / 60:.0f} min)")
+    done = 0
+    ib = IbData()
+    try:
+        for pid, ticker, strike, pc, exp, tdate, hhmm in todo:
+            if deadline and time.time() > deadline or not ib.data_ok():
+                break
+            c = Option(ticker, exp.replace("-", ""), strike, pc[0], "SMART", currency="USD")
+            if ib.call("qualifyContracts", c) and c.conId:
+                _price_spread(db, ib, pid, c, date.fromisoformat(tdate), f"{tdate} {hhmm}")
+                done += 1
+    finally:
+        ib.close()
+    log(f"IBKR: spreads recorded for {done} picks")
+    return {"spreads": done}
+
+
+OI_WAIT_SEC = 8       # IBKR usually sends open interest within a second or two
+OI_BATCH = 40         # contracts requested at once (well under the 100 market-data lines)
+
+
+def _snapshot_oi_batch(db, ib, items, snap_date):
+    """Open interest for a batch of (contract, key): request all, wait, read, cancel.
+    IBKR updates OI once a day, overnight."""
+    ib.call("reqMarketDataType", 1)          # live: IBKR sends OI only in live mode (not frozen)
+    field = lambda key: "callOpenInterest" if key[2] == "CALL" else "putOpenInterest"
+    tickers = [(ib.call("reqMktData", c, "100,101", False, False), key) for c, key in items]
+    end = time.time() + OI_WAIT_SEC
+    while time.time() < end and any(_num(getattr(t, field(k))) is None for t, k in tickers):
+        ib._ib.sleep(0.5)
+    n = 0
+    stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    for (t, key), (c, _) in zip(tickers, items):
+        ib.call("cancelMktData", c)
+        oi = _num(getattr(t, field(key)))
+        if oi is not None:
+            db.execute("INSERT OR REPLACE INTO ib_oi VALUES (?, ?, ?, ?, ?, ?, ?)", (*key, snap_date, oi, stamp))
+            n += 1
+    db.commit()
+    return n
+
+
+def snapshot_open_interest(db, ib=None, only_today_picks=False, log=print):
+    """Today's open interest for every pick contract still listed (or only today's new picks).
+    One snapshot per contract per day: comparing days shows whether a whale print OPENED a new
+    position (OI rises by about its size the next day) or closed one."""
+    from ib_async import Option
+    ensure_schema(db)
+    own = ib is None
+    if own:
+        if not available():
+            return 0
+        ib = IbData()
+    today = datetime.now(ET).date().isoformat()
+    try:
+        rows = db.execute(
+            "SELECT DISTINCT p.ticker, p.strike, p.put_call, p.expiration FROM picks p LEFT JOIN ib_oi o "
+            "ON o.ticker = p.ticker AND o.strike = p.strike AND o.put_call = p.put_call "
+            "AND o.expiration = p.expiration AND o.snap_date = ? WHERE p.expiration >= ? AND o.snap_date IS NULL"
+            + (" AND p.trade_date = ?" if only_today_picks else ""),
+            (today, today, today) if only_today_picks else (today, today)).fetchall()
+        n = 0
+        for i in range(0, len(rows), OI_BATCH):
+            if ib.idle_hook:      # a new ping's entry quote comes first
+                ib.idle_hook()
+            items = []
+            for key in rows[i:i + OI_BATCH]:
+                ticker, strike, pc, exp = key
+                c = Option(ticker, exp.replace("-", ""), strike, pc[0], "SMART", currency="USD")
+                if ib.call("qualifyContracts", c) and c.conId:
+                    items.append((c, key))
+            if items:
+                n += _snapshot_oi_batch(db, ib, items, today)
+        if rows and not only_today_picks:
+            log(f"IBKR: open interest recorded for {n} of {len(rows)} contracts")
+        return n
+    finally:
+        if own:
+            ib.close()
+
+
+def price_stock_iv(db, deadline=None, log=print):
+    """IBKR's daily 30-day implied volatility for every stock with picks (1 year the first time,
+    then the last few days). Gives 'were options cheap or expensive vs normal' context."""
+    from ib_async import Stock
+    ensure_schema(db)
+    if not available():
+        return {}
+    tickers = [r[0] for r in db.execute("SELECT DISTINCT ticker FROM picks UNION SELECT 'SPY' ORDER BY 1")]
+    have = dict(db.execute("SELECT ticker, MAX(day) FROM ib_stock_iv GROUP BY ticker").fetchall())
+    yesterday = (datetime.now(ET).date() - timedelta(days=1)).isoformat()
+    todo = [t for t in tickers if have.get(t, "") < yesterday and
+            not db.execute("SELECT 1 FROM ib_stock_days WHERE ticker = ? AND status = 'no_contract'", (t,)).fetchone()]
+    if not todo:
+        return {}
+    log(f"IBKR: stock implied-volatility history for {len(todo)} tickers (~{len(todo) * HIST_GAP_SEC / 60:.0f} min)")
+    n = 0
+    ib = IbData()
+    try:
+        for t in todo:
+            if deadline and time.time() > deadline or not ib.data_ok():
+                break
+            s = Stock(t, "SMART", "USD")
+            if not (ib.call("qualifyContracts", s) and s.conId):
+                continue
+            bars = ib.call("reqHistoricalData", s, endDateTime="", durationStr="1 Y" if t not in have else "10 D",
+                           barSizeSetting="1 day", whatToShow="OPTION_IMPLIED_VOLATILITY", useRTH=True, formatDate=1)
+            rows = [(t, str(b.date)[:10], b.close) for b in bars or [] if b.close and b.close > 0]
+            db.executemany("INSERT OR REPLACE INTO ib_stock_iv VALUES (?, ?, ?)", rows)
+            db.commit()
+            n += bool(rows)
+    finally:
+        ib.close()
+    log(f"IBKR: stock IV history for {n} tickers")
+    return {"stock_iv": n}
+
+
+EXP_LOOKBACK_DAYS = 4   # try contracts that expired this recently (IBKR drops them soon after)
 
 
 def price_expiries(db, deadline=None, log=print):
@@ -228,7 +387,7 @@ def price_expiries(db, deadline=None, log=print):
     evening the contract expires (while IBKR still lists it). Replaces Trade Echo's expiry-day
     stats, which cost credits and vanish for expired contracts."""
     from ib_async import Option
-    db.executescript(SCHEMA)
+    ensure_schema(db)
     if not available():
         log("IBKR: TWS is not accepting API connections - expiry stats skipped")
         return {}
@@ -363,7 +522,7 @@ def record_entries(db, ib, contracts, log=print):
         else:
             ib.no_subscription = False
             ib.call("reqMarketDataType", 1)
-            t = ib.call("reqMktData", c, "106", False, False)
+            t = ib.call("reqMktData", c, "101,106", False, False)   # open interest, implied vol
             end = time.time() + ENTRY_WAIT_SEC
             while time.time() < end and not ib.no_subscription and not (
                     (_num(t.bid) or 0) > 0 and (_num(t.ask) or 0) > 0):
@@ -373,7 +532,8 @@ def record_entries(db, ib, contracts, log=print):
             row.update(market_data_type=t.marketDataType, bid=_num(t.bid), ask=_num(t.ask), last=_num(t.last),
                        iv=_num(g.impliedVol) if g else None, delta=_num(g.delta) if g else None,
                        gamma=_num(g.gamma) if g else None, theta=_num(g.theta) if g else None,
-                       vega=_num(g.vega) if g else None, und_price=_num(g.undPrice) if g else None)
+                       vega=_num(g.vega) if g else None, und_price=_num(g.undPrice) if g else None,
+                       open_interest=_num(t.callOpenInterest if pc == "CALL" else t.putOpenInterest))
             live = (row["bid"] or 0) > 0 and (row["ask"] or 0) > 0 and t.marketDataType == 1
             row["status"] = "ok" if live else ("no_subscription" if ib.no_subscription else "no_quote")
         cols = list(row)
@@ -393,9 +553,10 @@ def run_live(db, in_session, next_open, my_tickers, log=print):
     from ib_async import Option, Stock
     global CLIENT_ID
     CLIENT_ID = LIVE_CLIENT_ID
-    db.executescript(SCHEMA)
+    ensure_schema(db)
     ib, contracts = None, {}
     busy = {"entries": False}
+    oi_day = {"date": None}
 
     def entries_hook():
         if busy["entries"] or ib is None:
@@ -432,6 +593,10 @@ def run_live(db, in_session, next_open, my_tickers, log=print):
                 ib, contracts = IbData(), {}
                 ib.idle_hook = entries_hook
             entries_hook()
+            if oi_day["date"] != now.date():   # once per session: OI of every listed pick contract
+                snapshot_open_interest(db, ib, log=log)
+                oi_day["date"] = now.date()
+            snapshot_open_interest(db, ib, only_today_picks=True, log=log)   # new picks' OI right away
             marks = ",".join("?" * len(my_tickers))
             picks = db.execute(
                 f"SELECT id, ticker, strike, put_call, expiration FROM picks WHERE trade_date = ? "
@@ -475,7 +640,7 @@ def price_underlyings(db, deadline=None, log=print):
     """1-minute stock bars for every (ticker, day) that has a pick - works for any past date,
     including picks whose options have expired. Gives the exact stock price at each print."""
     from ib_async import Stock
-    db.executescript(SCHEMA)
+    ensure_schema(db)
     if not available():
         log("IBKR: TWS is not accepting API connections - skipped (open TWS to enable)")
         return {}
@@ -578,16 +743,37 @@ def _price_pick(db, ib, pick):
     bid_hi = max(bid_after, key=lambda r: r[2]) if bid_after else None
     bid_close = bids[-1][4] if bids else None
     pct = lambda x: None if x is None else x / fill - 1
-    return save("ok", con_id=c.conId, n_trade_bars=len(trades), n_bid_bars=len(bids),
-                after_high=hi[2], after_low=lo[3], after_high_time=hi[0][11:], after_low_time=lo[0][11:],
-                day_close=trades[-1][4], after_bid_high=bid_hi[2] if bid_hi else None, bid_close=bid_close,
-                max_gain_pct=pct(hi[2]), max_loss_pct=pct(lo[3]), close_pct=pct(trades[-1][4]),
-                bid_max_gain_pct=pct(bid_hi[2]) if bid_hi else None, bid_close_pct=pct(bid_close))
+    status = save("ok", con_id=c.conId, n_trade_bars=len(trades), n_bid_bars=len(bids),
+                  after_high=hi[2], after_low=lo[3], after_high_time=hi[0][11:], after_low_time=lo[0][11:],
+                  day_close=trades[-1][4], after_bid_high=bid_hi[2] if bid_hi else None, bid_close=bid_close,
+                  max_gain_pct=pct(hi[2]), max_loss_pct=pct(lo[3]), close_pct=pct(trades[-1][4]),
+                  bid_max_gain_pct=pct(bid_hi[2]) if bid_hi else None, bid_close_pct=pct(bid_close))
+    _price_spread(db, ib, pid, c, td, fill_min, bids)
+    return status
+
+
+def _price_spread(db, ib, pid, contract, trade_date, fill_min, bids=None):
+    """ASK bars for the print day -> the bid/ask spread right after the print and over the day
+    (what entering and exiting really costs). Stored with the other bars; never used to grade."""
+    asks = _bars(ib, contract, trade_date, "ASK")
+    db.executemany("INSERT OR REPLACE INTO ib_bars VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                   [(pid, "ASK", *r) for r in asks])
+    if bids is None:
+        bids = [tuple(r) for r in db.execute("SELECT minute_et, open, high, low, close, volume FROM ib_bars "
+                                             "WHERE pick_id = ? AND kind = 'BID' ORDER BY minute_et", (pid,))]
+    bid_by_min = {r[0]: r[4] for r in bids if r[4] and r[4] > 0}
+    pairs = [(m, bid_by_min[m], a[4]) for a in asks if (m := a[0]) in bid_by_min and a[4] and a[4] >= bid_by_min[m]]
+    spreads = sorted((ask - bid) / ((ask + bid) / 2) for _, bid, ask in pairs)
+    first = next(((ask - bid, (ask - bid) / ((ask + bid) / 2)) for m, bid, ask in pairs if m > fill_min), (None, None))
+    db.execute("UPDATE ib_stats SET n_ask_bars = ?, spread_at_print = ?, spread_pct_at_print = ?, "
+               "median_spread_pct = ? WHERE pick_id = ?",
+               (len(asks), first[0], first[1], spreads[len(spreads) // 2] if spreads else None, pid))
+    db.commit()
 
 
 def price_picks(db, only_missing=True, deadline=None, log=print):
     """Record IBKR after-print stats for every finished-session pick whose contract is still listed."""
-    db.executescript(SCHEMA)
+    ensure_schema(db)
     if not available():
         log("IBKR: TWS is not accepting API connections - skipped (open TWS to enable)")
         return {}
