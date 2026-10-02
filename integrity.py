@@ -74,6 +74,20 @@ def run_checks(db, now_et, in_session, after_close_expected):
         else:
             add("logger_alive", OK, f"last poll {age_min:.1f} min ago")
 
+    # 2b. IBKR live tracker heartbeat (streams save a quote row about once a minute)
+    if in_session and now_et.strftime("%H:%M") >= "09:45":
+        try:
+            live = _one(db, "SELECT MAX(minute_et) FROM ib_live_quotes")
+        except sqlite3.OperationalError:
+            live = None
+        age_min = ((now_et.replace(tzinfo=None) - datetime.fromisoformat(live)).total_seconds() / 60
+                   if live else 1e9)
+        if age_min > 10:
+            add("ibkr_live_alive", FAIL, f"market is open but IBKR live tracking hasn't saved a quote for "
+                f"{min(age_min, 999):.0f} min - check TWS is logged in and the 'IBKR live Greeks' task is running")
+        else:
+            add("ibkr_live_alive", OK, f"IBKR live quotes {age_min:.1f} min old")
+
     # 3. Credits, refusals, errors in the last 24 h
     since = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat(timespec="seconds")
     over = _q(db, "SELECT substr(started_utc, 1, 13), SUM(credits_charged) FROM polls WHERE started_utc >= ? "
