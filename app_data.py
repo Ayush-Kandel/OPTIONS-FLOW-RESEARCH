@@ -182,7 +182,7 @@ def detail(pick_id):
         "greeks": {"iv": p["iv"], "delta": p["delta"],
                    "theta_contract": p["theta"] * 100 if p["theta"] is not None else None,
                    "spot": p["spot_at_print"]},
-        "pinged_at": _minute_of(p["pinged_utc"]),
+        "pinged_at": _minute_of(p["pinged_utc"]) if p["pinged_utc"] else None,
         "listed_at": _minute_of(p["first_seen_utc"]) if p["first_seen_utc"] else None,
         "whale_watch": {"seen": datetime.fromisoformat(whale[0]).astimezone(ET).strftime("%Y-%m-%d %H:%M:%S"),
                         "trade_time": whale[1]} if whale else None,

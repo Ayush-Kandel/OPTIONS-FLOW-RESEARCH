@@ -16,6 +16,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import app_data
+import app_research
 
 HOST, PORT = "127.0.0.1", 8060
 UI = Path(__file__).parent / "ui"
@@ -38,6 +39,16 @@ class Handler(SimpleHTTPRequestHandler):
                 data = app_data.pings(q.get("scope", "open"))
             elif name == "detail":
                 data = app_data.detail(int(q["id"]))
+            elif name == "learning":
+                data = app_research.learning()
+            elif name == "simulate":
+                num = lambda k: float(q[k]) if q.get(k) not in (None, "", "off") else None
+                data = app_research.simulate(q.get("group", "all"), q.get("side", "any"), q.get("entry", "whale"),
+                                             num("target"), num("stop"))
+            elif name == "grid":
+                data = app_research.exit_grid(q.get("group", "all"), q.get("side", "any"), q.get("entry", "whale"))
+            elif name == "predictions":
+                data = app_research.predictions(q.get("scope", "mine"))
             else:
                 return self.send_error(404)
             body, code = json.dumps(data, default=str).encode("utf-8"), 200
@@ -68,8 +79,19 @@ def serve():
     return True
 
 
+def _warm_up():
+    """Load the simulator's price paths and pandas in the background so the Learning and
+    Predictions tabs open instantly."""
+    try:
+        app_research._sim_data()
+        import pandas  # noqa: F401
+    except Exception:
+        pass
+
+
 def main():
     serve()
+    threading.Thread(target=_warm_up, daemon=True).start()
     url = f"http://{HOST}:{PORT}/"
     if "--browser" in sys.argv:
         print(f"FlowDesk at {url} (Ctrl+C to stop)")
