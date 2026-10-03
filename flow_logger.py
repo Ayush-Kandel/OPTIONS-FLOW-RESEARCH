@@ -912,6 +912,8 @@ def run_ibkr(db):
         ibkr.refresh_greeks(db)
     except Exception as e:
         print(f"{_stamp()} IBKR pricing failed: {type(e).__name__}: {e}")
+        pipeline.discord_send(f"🛑 **IBKR pricing failed** ({type(e).__name__}) - check TWS is open and unlocked.",
+                              bot="auditor")
 
 
 def run_overnight_harvest(db, te, budget, last_day):

@@ -1391,6 +1391,9 @@ def run_after_close(db, call, trade_date):
         ibkr.refresh_greeks(db)
     except Exception as e:
         print(f"IBKR pricing failed: {type(e).__name__}: {e} - training on what's there")
+        discord_send(f"🛑 **Nightly IBKR pricing failed** ({type(e).__name__}). Today's picks have no honest "
+                     "prices yet - check TWS is open and unlocked; 0DTE contracts vanish from IBKR within hours.",
+                     bot="auditor")
     result = train(db)
     print(f"Model: {_describe(result)}")
     db.execute("INSERT OR REPLACE INTO daily_runs (trade_date, finished_utc, summary) VALUES (?, ?, ?)",
