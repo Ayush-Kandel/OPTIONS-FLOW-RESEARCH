@@ -29,7 +29,7 @@ from pathlib import Path
 
 import numpy as np
 
-DB = Path(__file__).with_name("flow.db")
+DB = Path(os.environ.get("FLOW_DB") or Path(__file__).with_name("flow.db"))
 FEE = 0.65                      # per contract, each way
 OPEN_MIN = 9 * 60 + 30
 N_MIN = 405                     # 09:30 .. 16:14
