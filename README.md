@@ -51,6 +51,15 @@ Predicting the spike turned out not to be the same as picking profitable trades:
 
 `ibkr.price_legs()` records the real 1-minute bid/ask of each big whale's companion contracts (next strike out, next expiry, the other side) every night, so vertical, calendar and straddle strategies can be added once enough days are recorded.
 
+### Strategy Lab (runs nonstop)
+
+`lab.py --daemon` (kept alive by `run_lab.ps1` / the "Strategy Lab" task, at idle priority so live work always comes first) builds its own strategies - 1-3 conditions on *which* whales (call/put, DTE, time of day, size, whale bought/sold, IV, trend, the model's and judges' opinions, ...) x 6 ways in (now, after 2/5/15 min, a limit at the whale's price, no chasing) x 393 ways out (take-profit x stop-loss x time limits, trailing stops, overnight) - about **300 million strategies per search**, replayed on real IBKR minute bars (its standard column matches `trade_ret` exactly). Because that many tries always find something that looks great in hindsight, it only trusts:
+
+1. **The blind test of the search itself**: for every day D it searches using only days before D (ranking by average trade minus its standard error, then re-ranking the best by how consistently they did day by day) and trades the winner on D.
+2. **The luck test**: the whole blind test rerun on outcomes shuffled among each day's picks, over and over; p = share of shuffled runs that did at least as well.
+
+Status goes searching -> not profitable yet -> promising (blind trades positive, p < 0.20) -> **validated** (30+ blind trades, positive, p < 0.05 after 100+ luck tests), announced on Discord; everything stays paper until a live paper test confirms it. On Oct 3 (8 days of data) the best strategy *in hindsight* averaged +97% per trade, while the honest blind test made +17% per trade on 17 trades - all of it from one day, p = 0.25: not proven. FlowDesk's **Lab** tab shows all of it.
+
 ### More training data
 
 Whale-size raw prints ($350K+, 0-14 DTE) from the whale watch and the per-ticker polls become training picks (`source = 'whale'`, never pinged) after the close; `py flow_logger.py --whale-history` pulls the past week of them from Trade Echo's raw feed. They get IBKR prices, Greeks and both judges like any pick.
