@@ -47,6 +47,8 @@ class Handler(SimpleHTTPRequestHandler):
                                              num("target"), num("stop"))
             elif name == "grid":
                 data = app_research.exit_grid(q.get("group", "all"), q.get("side", "any"), q.get("entry", "whale"))
+            elif name == "contest":
+                data = app_research.contest(q.get("universe", "core"))
             elif name == "predictions":
                 data = app_research.predictions(q.get("scope", "mine"))
             else:

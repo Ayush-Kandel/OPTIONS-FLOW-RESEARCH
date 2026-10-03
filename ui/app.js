@@ -498,6 +498,65 @@ $("#gridTable").addEventListener("click", e => {
   runSim(false);
 });
 
+// ---------- contest ----------
+const TRADER = { hermes: ["🦉", "#a371f7"], qwen: ["🐉", "#58a6ff"], model: ["🧠", "#3fb950"], all: ["🐋", "#8b949e"] };
+let contestU = "core", contestWho = "hermes", contestData = null;
+const dollars = v => (v < 0 ? "−$" : "$") + Math.abs(v).toLocaleString(undefined, { maximumFractionDigits: 0 });
+async function loadContest() {
+  try {
+    const C = contestData = await api("contest", { universe: contestU });
+    const r = C.rules;
+    $("#contestRules").innerHTML = `<b>Same rules for everyone:</b> start with ${dollars(r.cash)} · put ${Math.round(r.size * 100)}% of the account in each trade
+      (if the cash is free) · buy at the <span class="term" data-tip="ask">ask</span> right after the whale's trade · sell at
+      ${pct(r.target)} or ${pct(r.stop)}, otherwise at the 4 PM <span class="term" data-tip="bid">bid</span> · $${r.fee.toFixed(2)} per contract fees each way.
+      <span class="muted">Fractional contracts are allowed, so expensive options still count. Updated every night after the close.</span>`;
+    const ranked = [...C.traders].sort((a, b) => b.final - a.final);
+    const medal = ["🥇", "🥈", "🥉", ""];
+    $("#contestBoard").innerHTML = ranked.map((x, i) => `
+      <div class="stat" style="${x.key === "all" ? "opacity:.75" : ""}">
+        <div class="label">${medal[i]} ${TRADER[x.key][0]} <b style="color:${TRADER[x.key][1]}">${esc(x.name)}</b></div>
+        <div class="value ${tone(x.ret)}">${dollars(x.final)}</div>
+        <div class="sub"><b class="${tone(x.ret)}">${pct(x.ret)}</b> · ${x.trades} trades · won ${x.wins}${x.trades ? ` (${Math.round(x.wins / x.trades * 100)}%)` : ""}</div>
+        <div class="sub">Biggest drop: ${pct(x.max_dd)}${x.skipped ? ` · ${x.skipped} skipped (no free cash)` : ""}</div>
+        <div class="sub muted">${esc(x.about)}</div>
+      </div>`).join("");
+    draw("contestChart", { type: "line", data: { labels: ["Start", ...C.days.map(dayShort)],
+      datasets: C.traders.map(x => ({ label: `${TRADER[x.key][0]} ${x.name}`, data: [r.cash, ...x.curve], borderColor: TRADER[x.key][1],
+        backgroundColor: TRADER[x.key][1], borderDash: x.key === "all" ? [5, 4] : [], tension: .2 })) },
+      options: { scales: { y: { ticks: { callback: v => "$" + v.toLocaleString() } } },
+        plugins: { tooltip: { callbacks: { label: c => `${c.dataset.label}: ${dollars(c.raw)}` } } } } });
+    $("#contestWho").innerHTML = C.traders.map(x => `<button data-who="${x.key}" class="${x.key === contestWho ? "active" : ""}">${TRADER[x.key][0]} ${esc(x.name)}</button>`).join("");
+    renderContestTrades();
+  } catch (e) {
+    $("#contestBoard").innerHTML = `<div class="error">Couldn't load the contest: ${esc(e.message)}</div>`;
+  }
+}
+function renderContestTrades() {
+  const x = contestData.traders.find(t => t.key === contestWho);
+  const why = { target: "Took profit", stop: "Stopped out", close: "Sold at 4 PM" };
+  $("#contestTrades").innerHTML = `<tr><th>When</th><th>Contract</th><th class="num">Paid</th><th class="num">Put in</th>
+    <th class="num">Result</th><th class="num">Profit</th><th>How it ended</th></tr>` +
+    (x.log.length ? x.log.map(t => `<tr class="click" data-id="${t.id}"><td>${dayShort(t.start)} ${clock(t.start)}</td><td>${esc(t.contract)}</td>
+      <td class="num">${money(t.entry)}</td><td class="num">${dollars(t.stake)}</td><td class="num ${tone(t.ret)}">${pct(t.ret)}</td>
+      <td class="num ${tone(t.pnl)}">${t.pnl >= 0 ? "+" : ""}${dollars(t.pnl)}</td><td>${why[t.why] || ""}</td></tr>`).join("")
+      : `<tr><td colspan="7" class="muted">No trades yet.</td></tr>`);
+}
+$("#contestUniverse").addEventListener("click", e => {
+  const b = e.target.closest("button"); if (!b) return;
+  contestU = b.dataset.u;
+  document.querySelectorAll("#contestUniverse button").forEach(x => x.classList.toggle("active", x === b));
+  loadContest();
+});
+$("#contestWho").addEventListener("click", e => {
+  const b = e.target.closest("button"); if (!b) return;
+  contestWho = b.dataset.who;
+  document.querySelectorAll("#contestWho button").forEach(x => x.classList.toggle("active", x === b));
+  renderContestTrades();
+});
+$("#contestTrades").addEventListener("click", e => {
+  const row = e.target.closest("tr[data-id]"); if (row) openDetail(row.dataset.id);
+});
+
 // ---------- predictions ----------
 let predScope = "mine";
 async function loadPredictions() {
@@ -560,7 +619,8 @@ function renderHelp() {
 }
 
 // ---------- navigation ----------
-const LOADERS = { live: () => loadList(), learning: () => loadLearning(), predictions: () => loadPredictions() };
+const LOADERS = { live: () => loadList(), learning: () => loadLearning(), predictions: () => loadPredictions(),
+  contest: () => loadContest() };
 
 function showView(view) {
   if (view === "detail" && state.view !== "detail") state.prevView = state.view;
@@ -587,7 +647,8 @@ $("#scope").addEventListener("click", e => {
 function openDetail(id) {
   state.detailId = id;
   showView("detail");
-  $("#back").textContent = { learning: "← Back to Learning", predictions: "← Back to Predictions" }[state.prevView] || "← Back to all pings";
+  $("#back").textContent = { learning: "← Back to Learning", predictions: "← Back to Predictions",
+    contest: "← Back to the Contest" }[state.prevView] || "← Back to all pings";
   $("#detail").innerHTML = '<p class="muted">Loading…</p>';
   loadDetail();
 }

@@ -112,7 +112,7 @@ def _sim_data():
                                  (run["version"], run["model_kind"]))) if run else {}
         picks = db.execute(
             "SELECT p.id, p.ticker, p.strike, p.put_call, p.expiration, p.trade_date, p.trade_time_et, p.fill_price, "
-            "p.premium, p.score, p.pinged_utc, c.side, c.structure, c.our_leg FROM picks p "
+            "p.premium, p.score, p.pinged_utc, p.hermes_verdict, p.qwen_verdict, c.side, c.structure, c.our_leg FROM picks p "
             "JOIN ib_stats s ON s.pick_id = p.id LEFT JOIN pick_context c ON c.pick_id = p.id AND c.status = 'ok' "
             "WHERE s.status = 'ok' AND s.n_bid_bars > 0 ORDER BY p.trade_date, p.trade_time_et").fetchall()
         # one indexed range read per pick (a joined string comparison can't use the index: ~10x slower)
@@ -143,6 +143,7 @@ def _sim_data():
             "minutes": [r[0] for r in path], "high": np.array([r[1] for r in path]), "low": np.array([r[2] for r in path]),
             "close": np.array([r[3] for r in path]),
             "side": p["side"] or "unknown", "sold": sold, "structure": p["structure"],
+            "takes": {"hermes": p["hermes_verdict"] == "take", "qwen": p["qwen_verdict"] == "take"},
             "groups": {"all", *(["core"] if core else []), *(["mine"] if core and p["ticker"] in MY_TICKERS else []),
                        *(["model"] if replay.get(p["id"]) is not None and replay[p["id"]] >= bar else []),
                        *(["pings"] if p["pinged_utc"] else [])},
@@ -167,16 +168,16 @@ def _exit(t, price, start, target, stop):
     is checked first inside a minute (cautious); else sell at the day's last bid."""
     i0 = next((i for i, m in enumerate(t["minutes"]) if m > start), None)
     if i0 is None:
-        return None, None
+        return None, None, None
     hi, lo = t["high"][i0:], t["low"][i0:]
     n = len(hi)
     s_idx = int(np.argmax(lo <= price * (1 + stop))) if stop is not None and (lo <= price * (1 + stop)).any() else n
     t_idx = int(np.argmax(hi >= price * (1 + target))) if target is not None and (hi >= price * (1 + target)).any() else n
     if s_idx <= t_idx and s_idx < n:
-        return stop, "stop"
+        return stop, "stop", t["minutes"][i0 + s_idx]
     if t_idx < n:
-        return target, "target"
-    return float(t["close"][-1] / price - 1), "close"
+        return target, "target", t["minutes"][i0 + t_idx]
+    return float(t["close"][-1] / price - 1), "close", t["minutes"][-1]
 
 
 def _select(data, group, side):
@@ -194,7 +195,7 @@ def simulate(group="all", side="any", entry="whale", target=None, stop=None):
         e = _entry(t, entry)
         if not e or not e[0]:
             continue
-        ret, why = _exit(t, e[0], e[1], target, stop)
+        ret, why, _ = _exit(t, e[0], e[1], target, stop)
         if ret is not None:
             results.append({"id": t["id"], "day": t["day"], "start": t["start"], "contract": t["contract"],
                             "side": t["side"], "entry": e[0], "ret": ret, "why": why})
@@ -230,6 +231,95 @@ def exit_grid(group="all", side="any", entry="whale"):
                           "avg": float(np.mean(rets)) if rets else None,
                           "win_rate": float(np.mean([r > 0 for r in rets])) if rets else None})
     return {"targets": GRID_TARGETS, "stops": GRID_STOPS, "cells": cells}
+
+
+# ------------------------------------------------------------------- contest --
+
+# Paper-money contest: each trader starts with $5,000 and buys the picks IT chose, under the same rules,
+# so only the picking differs. A separate scoreboard: nothing here is fed back to the judges or the model.
+CONTEST_CASH = 5000.0
+CONTEST_SIZE = 0.10                    # of the account per trade (fractional contracts allowed)
+CONTEST_TARGET, CONTEST_STOP = 0.30, -0.50
+FEE_PER_CONTRACT = 0.65                # IBKR's options commission, each way
+CONTESTANTS = [("hermes", "Hermes", "AI judge on this PC - buys when it says 'take'"),
+               ("qwen", "Qwen", "AI judge on this PC - buys when it says 'take'"),
+               ("model", "The model", "machine-learning model - buys the picks it would ping (tested blind)"),
+               ("all", "Follow every whale", "baseline - buys every pick")]
+
+
+def _chooses(key, t):
+    return True if key == "all" else ("model" in t["groups"]) if key == "model" else t["takes"][key]
+
+
+def _run_account(trades):
+    """trades: (entry minute, exit minute, entry price, return, trade). Cash is tied up until each exit;
+    each new trade gets 10% of the account (cash + money in open trades), if the cash is there."""
+    import heapq
+    cash, heap, seq, log, by_day, skipped = CONTEST_CASH, [], 0, [], {}, 0
+
+    def settle(until):
+        nonlocal cash
+        while heap and heap[0][0] <= until:
+            ex_m, _, stake, contracts, ret, rec = heapq.heappop(heap)
+            fee_out = FEE_PER_CONTRACT * contracts
+            cash += stake * (1 + ret) - fee_out
+            rec["pnl"] = stake * ret - rec["fee_in"] - fee_out
+            by_day[ex_m[:10]] = cash + sum(h[2] for h in heap)
+
+    for entry_m, exit_m, price, ret, t in sorted(trades, key=lambda x: x[0]):
+        settle(entry_m)
+        equity = cash + sum(h[2] for h in heap)
+        per_dollar_fee = FEE_PER_CONTRACT / (price * 100)
+        stake = min(equity * CONTEST_SIZE, cash / (1 + per_dollar_fee))
+        if stake < 25:                      # no cash left right now
+            skipped += 1
+            continue
+        contracts = stake / (price * 100)
+        rec = {"start": entry_m, "contract": t["contract"], "entry": price, "stake": stake, "ret": ret,
+               "fee_in": FEE_PER_CONTRACT * contracts, "why": None, "id": t["id"]}
+        cash -= stake + rec["fee_in"]
+        heapq.heappush(heap, (exit_m, seq, stake, contracts, ret, rec))
+        seq += 1
+        log.append(rec)
+    settle("9999")
+    return cash, log, by_day, skipped
+
+
+def contest(universe="all"):
+    """universe: 'all' picks the judges judged, 'core' = big noteworthy picks ($350K+), 'mine' = your tickers."""
+    data = _sim_data()
+    days = sorted({t["day"] for t in data["trades"]})
+    out = []
+    for key, name, about in CONTESTANTS:
+        trades = []
+        for t in data["trades"]:
+            if universe not in t["groups"] or not _chooses(key, t) or not t["ask_print"]:
+                continue
+            ret, why, exit_m = _exit(t, t["ask_print"], t["start"], CONTEST_TARGET, CONTEST_STOP)
+            if ret is not None:
+                trades.append((t["start"], exit_m, t["ask_print"], ret, t))
+                t.setdefault("_why", {})[key] = why
+        final, log, by_day, skipped = _run_account(trades)
+        curve, value = [], CONTEST_CASH
+        for d in days:                      # end-of-day account value, carried over quiet days
+            value = by_day.get(d, value)
+            curve.append(round(value, 2))
+        peak, max_dd = CONTEST_CASH, 0.0
+        for v in [CONTEST_CASH] + curve:
+            peak = max(peak, v)
+            max_dd = min(max_dd, v / peak - 1)
+        pnls = [r["pnl"] for r in log]
+        by_id = {t["id"]: t for t in data["trades"]}
+        out.append({
+            "key": key, "name": name, "about": about, "final": final, "ret": final / CONTEST_CASH - 1,
+            "trades": len(log), "wins": sum(p > 0 for p in pnls), "skipped": skipped, "max_dd": max_dd,
+            "best": max(pnls) if pnls else None, "worst": min(pnls) if pnls else None, "curve": curve,
+            "log": [{"start": r["start"], "contract": r["contract"], "entry": r["entry"], "stake": round(r["stake"], 2),
+                     "ret": r["ret"], "pnl": round(r["pnl"], 2), "id": r["id"],
+                     "why": by_id[r["id"]].get("_why", {}).get(key)} for r in sorted(log, key=lambda r: r["start"], reverse=True)[:80]],
+        })
+    return {"universe": universe, "days": days, "traders": out, "rules": {"cash": CONTEST_CASH, "size": CONTEST_SIZE, "target": CONTEST_TARGET,
+                                                    "stop": CONTEST_STOP, "fee": FEE_PER_CONTRACT}}
 
 
 # --------------------------------------------------------------- predictions --

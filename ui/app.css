@@ -124,6 +124,8 @@ main { max-width: 1400px; margin: 0 auto; padding: 20px 24px 48px; }
 .gloss dt { font-weight: 700; }
 .gloss dd { margin: 0; color: #c9d1d9; }
 
+.rules { font-size: 14px; line-height: 1.6; }
+
 /* learning + predictions */
 h2.section { font-size: 18px; margin: 26px 0 12px; }
 .small { font-size: 13px; margin: -4px 0 10px; }

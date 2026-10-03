@@ -15,6 +15,7 @@
   <nav class="tabs" id="tabs">
     <button data-tab="live" class="active">Live</button>
     <button data-tab="predictions">Predictions</button>
+    <button data-tab="contest">Contest</button>
     <button data-tab="learning">Learning</button>
     <button data-tab="help">Help</button>
   </nav>
@@ -78,6 +79,33 @@
       </div>
     </div>
     <div class="panel table-wrap"><table class="table" id="predTable"></table></div>
+  </section>
+
+  <!-- CONTEST: paper money for Hermes, Qwen and the model -->
+  <section id="view-contest" class="view hidden">
+    <p class="intro">
+      <b>Paper-money contest.</b> Hermes, Qwen and the model each got <b>$5,000</b> of pretend money on Sep 23 and trade
+      the picks <i>they</i> chose, under the same rules - so the only difference is how well each one picks.
+      It's a separate scoreboard: nothing here changes how the judges or the model think.
+    </p>
+    <div class="panel rules" id="contestRules"></div>
+    <div class="toolbar" style="margin-top:14px">
+      <div class="segmented" id="contestUniverse">
+        <button data-u="core" class="active">Big noteworthy picks ($350K+)</button>
+        <button data-u="mine">Your 12 tickers</button>
+        <button data-u="all">Everything they judged</button>
+      </div>
+    </div>
+    <div class="stats" id="contestBoard"></div>
+    <div class="panel">
+      <h3>Account value at the end of each day</h3>
+      <div class="chart-wrap"><canvas id="contestChart"></canvas></div>
+    </div>
+    <div class="toolbar" style="margin-top:18px">
+      <h2 class="section" style="margin:0">Trades</h2>
+      <div class="segmented" id="contestWho"></div>
+    </div>
+    <div class="panel table-wrap"><table class="table" id="contestTrades"></table></div>
   </section>
 
   <!-- LEARNING: training, backtests, exit simulator -->
