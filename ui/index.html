@@ -17,6 +17,7 @@
     <button data-tab="predictions">Predictions</button>
     <button data-tab="contest">Contest</button>
     <button data-tab="learning">Learning</button>
+    <button data-tab="lab">Lab</button>
     <button data-tab="help">Help</button>
   </nav>
   <div class="health" id="health"></div>
@@ -202,6 +203,43 @@
     <div class="panel table-wrap" style="margin-top:14px">
       <h3>The trades</h3>
       <table class="table" id="simTrades"></table>
+    </div>
+  </section>
+
+  <!-- LAB: the strategy search that runs nonstop -->
+  <section id="view-lab" class="view hidden">
+    <p class="intro">
+      The <b>Strategy Lab</b> builds its own strategies - <i>which</i> whales (call/put, days to expiry, time of day,
+      size, bought or sold, IV, trend, the AI's opinions...) × <i>how</i> to get in × <i>how</i> to get out - and tests
+      hundreds of millions of them on real IBKR prices, nonstop, using your PC's spare power.
+      Trying that many <b>always</b> finds some that look amazing in hindsight, so the Lab only trusts two things:
+      a <span class="term" data-tip="blindtest">blind test</span> and a <span class="term" data-tip="lucktest">luck test</span>.
+    </p>
+    <div class="panel rules" id="labStatus"></div>
+    <div class="stats" id="labStats" style="margin-top:14px"></div>
+    <div class="grid2">
+      <div class="panel">
+        <h3>Luck test: real result vs. shuffled data</h3>
+        <p class="muted small">Each grey bar = how the whole search did when the outcomes were shuffled (no real pattern
+          left). The green line = the real blind result. It's only real if it beats almost all of the grey.</p>
+        <div class="chart-wrap"><canvas id="labNullChart"></canvas></div>
+      </div>
+      <div class="panel">
+        <h3>Blind trades: $1,000 each</h3>
+        <p class="muted small">Every day the Lab trades the strategy it found using only earlier days. This is the honest
+          track record.</p>
+        <div class="chart-wrap"><canvas id="labCurveChart"></canvas></div>
+      </div>
+    </div>
+    <div class="panel table-wrap" style="margin-top:14px">
+      <h3>The blind trades</h3>
+      <table class="table" id="labTrades"></table>
+    </div>
+    <div class="panel table-wrap" style="margin-top:14px">
+      <h3>Best strategies in hindsight <span class="soon">not proof</span></h3>
+      <p class="muted small">What the search finds on all the data so far. These look great because they were picked
+        after the fact - the blind test above is what tells you if this kind of search really works.</p>
+      <table class="table" id="labTop"></table>
     </div>
   </section>
 

@@ -1002,10 +1002,10 @@ def train(db):
              for k, v in preds.items() if v]
     for m in pickers:
         if len(picked[m]["pred"]) == len(truth):
-            picked[m]["pred"] = list(never(picked[m]["pred"]))
-            row = {"kind": PICKER_PREFIX + m, **_score_predictions(PROFIT_PREFIX, np.array(picked[m]["pred"]), truth,
+            scored = never(picked[m]["pred"])      # the "never take" marker is for scoring only, never stored
+            row = {"kind": PICKER_PREFIX + m, **_score_predictions(PROFIT_PREFIX, scored, truth,
                                                                   np.array(picked[m]["real"]))}
-            chosen = np.array(picked[m]["pred"]) >= row["threshold"]
+            chosen = scored >= row["threshold"]
             row["strategies"] = {s: int(sum(1 for c, k in zip(picked[m]["choice"], chosen) if k and c == s))
                                  for s in strat_keys}
             board.append(row)

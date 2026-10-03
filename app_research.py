@@ -50,7 +50,8 @@ def _latest_run(db):
 
 
 def _is_profit(kind):
-    return bool(kind) and kind.startswith("profit:")
+    """Models whose guesses are a trade result (profit-trained and strategy pickers), not a spike."""
+    return bool(kind) and kind.startswith(("profit:", "picker:"))
 
 
 def _rank_corr(a, b):
@@ -378,6 +379,43 @@ def contest(universe="all"):
             "strategy_names": {k: s["name"] for k, s in strategies.STRATEGIES.items()},
             "rules": {"cash": CONTEST_CASH, "size": CONTEST_SIZE, "target": CONTEST_TARGET,
                                                     "stop": CONTEST_STOP, "fee": FEE_PER_CONTRACT}}
+
+
+# ----------------------------------------------------------------------- lab --
+
+def lab():
+    """The Strategy Lab's latest run (lab.py): its honest blind test, the luck test, and what it found."""
+    with closing(_db()) as db:
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE name = 'lab_runs'").fetchone():
+            return {"run": None}
+        run = db.execute("SELECT * FROM lab_runs WHERE finished_utc IS NOT NULL ORDER BY id DESC LIMIT 1").fetchone()
+        if not run:
+            return {"run": None}
+        run = dict(run)
+        nulls = [r[0] for r in db.execute("SELECT blind_avg FROM lab_null WHERE run_id = ? AND blind_avg IS NOT NULL",
+                                          (run["id"],))]
+        trades = [dict(r) for r in db.execute(
+            "SELECT t.day, t.pick_id, t.strategy, t.ret, p.ticker, p.strike, p.put_call, p.expiration, p.trade_time_et "
+            "FROM lab_trades t JOIN picks p ON p.id = t.pick_id WHERE t.run_id = ? ORDER BY t.day, p.trade_time_et",
+            (run["id"],))]
+        history = [dict(r) for r in db.execute(
+            "SELECT id, finished_utc, n_picks, n_days, blind_n, blind_avg, status FROM lab_runs "
+            "WHERE finished_utc IS NOT NULL ORDER BY id")]
+        n_runs_all = db.execute("SELECT COUNT(*) FROM lab_null").fetchone()[0]
+    real = run["blind_avg"]
+    p = (1 + sum(v >= real for v in nulls)) / (1 + len(nulls)) if real is not None and nulls else None
+    for t in trades:
+        t["strategy"] = json.loads(t["strategy"])
+    curve, total = [], 0.0
+    for t in trades:
+        total += t["ret"] * DOLLARS_PER_TRADE
+        curve.append([t["day"], round(total, 2)])
+    return {"run": {k: run[k] for k in ("id", "finished_utc", "n_picks", "n_days", "n_conditions", "n_columns",
+                                        "n_strategies", "blind_n", "blind_avg", "blind_total", "blind_win", "blind_days",
+                                        "status")},
+            "best": json.loads(run["best_json"] or "null"), "top": json.loads(run["top_json"] or "[]"),
+            "nulls": nulls, "p": p, "trades": trades, "curve": curve, "history": history,
+            "luck_tests_total": n_runs_all, "dollars_per_trade": DOLLARS_PER_TRADE}
 
 
 # --------------------------------------------------------------- predictions --
