@@ -223,6 +223,8 @@ def open_db(path=DB_PATH):
     db.executescript(SCHEMA)
     if "conn" not in {r[1] for r in db.execute("PRAGMA table_info(polls)")}:
         db.execute("ALTER TABLE polls ADD COLUMN conn INTEGER")   # 2 = second Trade Echo connection
+    if "raw_json" not in {r[1] for r in db.execute("PRAGMA table_info(prints)")}:
+        db.execute("ALTER TABLE prints ADD COLUMN raw_json TEXT")  # the row exactly as Trade Echo sent it
     pipeline.ensure_schema(db)
     import bots
     import integrity
@@ -462,15 +464,15 @@ def _store_prints(db, rows, poll_id, ticker=None):
         cur = db.execute(
             "INSERT OR IGNORE INTO prints (ticker, strike, expiration, put_call, trade_date, "
             "trade_time_et, size, fill_price, premium, spot, dte_days, sentiment, "
-            "activity_type, updated_utc, first_seen_utc, poll_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "activity_type, updated_utc, first_seen_utc, poll_id, raw_json) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (r.get("ticker") or ticker, r.get("strike_price"),
              (r.get("date_expiration") or "")[:10], r.get("put_call"),
              r.get("trade_date"), r.get("trade_time_et"), r.get("size"),
              r.get("fill_price"),
              round(premium, 2) if isinstance(premium, (int, float)) else None,
              r.get("spot"), r.get("dteDays"), r.get("sentiment"),
-             r.get("option_activity_type"), r.get("updated"), seen, poll_id))
+             r.get("option_activity_type"), r.get("updated"), seen, poll_id, json.dumps(r)))
         if cur.rowcount:
             new.append(r)
     return new
@@ -497,6 +499,31 @@ def poll_whales(te, db, budget, et):
     db.commit()
     mine = [r for r in new if r.get("ticker") in pipeline.MY_TICKERS]
     return rows, new, mine, flag, t_from.strftime("%H:%M")
+
+
+def harvest_whale_history(db, call, sessions, deadline):
+    """Past whale-size prints from Trade Echo's raw feed (it keeps about a week): the whole tape, $350K+,
+    0-14 DTE, in windows that split in half when they come back full. Saved like the whale watch's prints,
+    then turned into training picks. Returns the new pick ids."""
+    new_ids = []
+    for s in sessions:
+        pages = []
+        try:
+            pipeline._fetch_split(call, lambda a, b: {
+                "date": s, "time_from": a, "time_to": b, "min_premium": pipeline.NOTEWORTHY_MIN_PREMIUM,
+                "max_dte_days": MAX_DTE_DAYS, "limit": FLOW_LIMIT}, "get_option_flow",
+                lambda p: pipeline._rows(p, "rows"), FLOW_LIMIT, "09:30", "16:15", deadline, pages)
+        except pipeline.HarvestStopped:
+            print(f"{_stamp()} whale history: stopped at the deadline")
+            break
+        poll_id = db.execute("SELECT MAX(id) FROM polls WHERE kind = 'harvest'").fetchone()[0]
+        rows = [r for p in pages for r in pipeline._rows(p, "rows") if r.get("trade_date") == s]
+        stored = len(_store_prints(db, rows, poll_id))
+        db.commit()
+        ids = pipeline.add_whale_picks(db, s)
+        new_ids += ids
+        print(f"{_stamp()} whale history {s}: {len(rows)} prints ({stored} new), {len(ids)} new training picks")
+    return new_ids
 
 
 def poll_flow(te, db, budget, ticker, first_today):
@@ -1121,6 +1148,7 @@ def show_status():
 
 
 def main():
+    global _whale_budget
     parser = argparse.ArgumentParser(description="Trade Echo options-flow capture logger")
     parser.add_argument("--once", metavar="TICKER", help="one flow poll, then exit")
     parser.add_argument("--once-dealer", metavar="TICKER", help="one Dealer Edge poll, then exit")
@@ -1143,6 +1171,9 @@ def main():
     parser.add_argument("--context", nargs="?", const=0, type=int, metavar="MAX_PICKS",
                         help="trade context backfill: was each whale buying or selling, spread legs "
                              "(2 credits per pick, both connections; stops before the open)")
+    parser.add_argument("--whale-history", nargs="?", const=0, type=int, metavar="SESSIONS",
+                        help="more training data: past whale-size raw prints from Trade Echo (about a week back) "
+                             "become training picks, then judges, IBKR prices and a retrain")
     parser.add_argument("--ibkr", action="store_true",
                         help="price still-listed picks from IBKR 1-minute bars (TWS must be open)")
     parser.add_argument("--ibkr-live", action="store_true",
@@ -1183,12 +1214,30 @@ def main():
             import trade_context
             db = open_db()
             main_budget = CreditBudget.from_db(db)
-            global _whale_budget
             _whale_budget = CreditBudget.from_db(db, whale=True, recent=main_budget.recent)
             call = make_budgeted_call(TradeEcho(load_token()), db, main_budget,
                                       (TradeEcho(load_token()), _whale_budget))
             deadline = next_open_et(now_et(), skip_today=now_et().time() >= SESSION_OPEN).timestamp() - 30 * 60
             trade_context.backfill(db, call, deadline=deadline, limit=args.context or None)
+        elif args.whale_history is not None:
+            acquire_single_instance_lock_named("harvest")   # shares the overnight credit budget
+            db = open_db()
+            main_budget = CreditBudget.from_db(db)
+            _whale_budget = CreditBudget.from_db(db, whale=True, recent=main_budget.recent)
+            call = make_budgeted_call(TradeEcho(load_token()), db, main_budget,
+                                      (TradeEcho(load_token()), _whale_budget))
+            now = now_et()
+            deadline = next_open_et(now, skip_today=now.time() >= SESSION_OPEN).timestamp() - 30 * 60
+            last = now.date() - timedelta(days=1 if now.time() < SESSION_CLOSE else 0)
+            while last.weekday() >= 5:
+                last -= timedelta(days=1)
+            sessions = harvest_sessions(last)
+            sessions = sessions[-args.whale_history:] if args.whale_history else sessions
+            ids = harvest_whale_history(db, call, sessions, deadline)
+            print(f"{_stamp()} Greeks + both judges for {len(ids)} new training picks...")
+            pipeline.handle_new_picks(db, ids, live=False)
+            run_ibkr(db)   # free IBKR prices for the still-listed ones (incl. the ask for the trade result)
+            print(f"{_stamp()} Model: {pipeline._describe(pipeline.train(db))}")
         elif args.harvest:
             acquire_single_instance_lock_named("harvest")
             db = open_db()

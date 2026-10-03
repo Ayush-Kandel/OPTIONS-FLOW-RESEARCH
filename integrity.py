@@ -152,7 +152,7 @@ def run_checks(db, now_et, in_session, after_close_expected):
         if rule_bad else "every pick meets the score and DTE rules")
 
     # 4b. Provenance: every record must trace back to a real Trade Echo response (no made-up data)
-    allowed = ("live", "sweep", "backfill", "history", "harvest", "algo")
+    allowed = ("live", "sweep", "backfill", "history", "harvest", "algo", "whale")
     bad_source = _one(db, f"SELECT COUNT(*) FROM picks WHERE source NOT IN ({','.join('?' * len(allowed))}) "
                           "OR source IS NULL", allowed)
     raw_bad = 0
@@ -166,6 +166,12 @@ def run_checks(db, now_et, in_session, after_close_expected):
                                 and str(r.get("callOrPut", "")).upper() == pc
                                 and str(r.get("expiration", ""))[:10] == exp
                                 and abs(float(r.get("fillPrice")) - fill) < 1e-9)
+            elif source == "whale":  # a raw whale-size print from Trade Echo's flow feed
+                raw_bad += not (str(r.get("ticker", "")).upper() == tk
+                                and abs(float(r.get("strike_price")) - strike) < 1e-9
+                                and str(r.get("put_call", "")).upper() == pc
+                                and str(r.get("date_expiration", ""))[:10] == exp
+                                and abs(float(r.get("fill_price")) - fill) < 1e-9)
             else:
                 raw_bad += not (str(r.get("ticker", "")).upper() == tk and r.get("contract") == contract
                                 and abs(float(r.get("fillPrice")) - fill) < 1e-9)

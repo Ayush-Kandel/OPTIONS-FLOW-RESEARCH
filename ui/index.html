@@ -59,9 +59,10 @@
     <div class="stats" id="scorecard"></div>
     <div class="grid2">
       <div class="panel">
-        <h3>When the model says X, what really happens?</h3>
-        <p class="muted small">Each bar groups picks by the model's guess (made by a model trained only on earlier
-          days) and shows how many really became winners.</p>
+        <h3>When the model says X, what would you have earned?</h3>
+        <p class="muted small">Picks grouped by the model's guess (made by a model trained only on earlier days),
+          and what each group really earned per trade: buy at the ask right after the whale, sell at +30% / −50% / 4 PM,
+          after fees.</p>
         <div class="chart-wrap"><canvas id="calibChart"></canvas></div>
       </div>
       <div class="panel">
@@ -119,13 +120,14 @@
     <div class="grid2">
       <div class="panel">
         <h3>Is it getting smarter?</h3>
-        <p class="muted small">Share of the model's picks that became winners vs. all picks, after each night's training.</p>
+        <p class="muted small">What the model's picks earned per trade in the blind test (buy at the ask right after the
+          whale, sell at +30% / −50% / 4 PM, after fees) vs. following every whale, after each night's training.</p>
         <div class="chart-wrap"><canvas id="historyChart"></canvas></div>
       </div>
       <div class="panel">
         <h3>Tonight's model contest</h3>
-        <p class="muted small"><span class="term" data-tip="rank">Rank agreement</span>: how well each model orders
-          picks from worst to best (0 = random, 1 = perfect). The winner is green.</p>
+        <p class="muted small">Each model's result per trade in the blind test, using its own "only take trades
+          above X" rule. Highest wins and decides tomorrow's pings (green).</p>
         <div class="chart-wrap"><canvas id="boardChart"></canvas></div>
       </div>
       <div class="panel">

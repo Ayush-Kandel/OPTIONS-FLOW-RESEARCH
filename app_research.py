@@ -41,9 +41,15 @@ FEATURE_WORDS = {
 
 
 def _latest_run(db):
+    cols = {r[1] for r in db.execute("PRAGMA table_info(model_runs)")}
+    profit = ("cv_profit_avg, base_profit_avg" if "cv_profit_avg" in cols else "NULL AS cv_profit_avg, NULL AS base_profit_avg")
     return db.execute("SELECT version, model_kind, ping_threshold, leaderboard, run_utc, n_rows, cv_spearman, "
-                      "cv_hit_rate, cv_n_hit, base_rate_hit FROM model_runs WHERE status = 'trained' "
+                      f"cv_hit_rate, cv_n_hit, base_rate_hit, {profit} FROM model_runs WHERE status = 'trained' "
                       "ORDER BY id DESC LIMIT 1").fetchone()
+
+
+def _is_profit(kind):
+    return bool(kind) and kind.startswith("profit:")
 
 
 def _rank_corr(a, b):
@@ -56,10 +62,13 @@ def _rank_corr(a, b):
 
 def learning():
     with closing(_db()) as db:
+        cols = {r[1] for r in db.execute("PRAGMA table_info(model_runs)")}
+        profit = ("cv_profit_avg AS profit, base_profit_avg AS base_profit" if "cv_profit_avg" in cols
+                  else "NULL AS profit, NULL AS base_profit")
         runs = [dict(r) for r in db.execute(
             "SELECT run_utc, version, model_kind, n_rows, cv_spearman AS rank, cv_hit_rate AS hit, cv_n_hit AS n_pings, "
-            "base_rate_hit AS base, ping_threshold AS bar FROM model_runs WHERE status = 'trained' "
-            "AND target = 'after_print_gain' ORDER BY id")]
+            f"base_rate_hit AS base, ping_threshold AS bar, {profit} FROM model_runs WHERE status = 'trained' "
+            "AND target IN ('after_print_gain', 'trade_profit') ORDER BY id")]
         run = _latest_run(db)
         board = json.loads(run["leaderboard"]) if run and run["leaderboard"] else []
         # walk-forward replay: each day predicted by a model that only saw earlier days
@@ -84,7 +93,9 @@ def learning():
     return {"runs": runs, "board": board, "winner": run["model_kind"] if run else None, "bar": bar,
             "replay": replay, "inputs": inputs,
             "latest": {"version": run["version"], "n": run["n_rows"], "rank": run["cv_spearman"], "hit": run["cv_hit_rate"],
-                       "n_pings": run["cv_n_hit"], "base": run["base_rate_hit"]} if run else None}
+                       "n_pings": run["cv_n_hit"], "base": run["base_rate_hit"], "kind": run["model_kind"],
+                       "profit": run["cv_profit_avg"], "base_profit": run["base_profit_avg"],
+                       "profit_model": _is_profit(run["model_kind"])} if run else None}
 
 
 def _share(xs):
@@ -328,15 +339,17 @@ def predictions(scope="mine"):
     from pipeline import MY_TICKERS
     with closing(_db()) as db:
         run = _latest_run(db)
+        has_trade = "trade_ret" in {r[1] for r in db.execute("PRAGMA table_info(picks)")}
         graded = db.execute(
-            "SELECT p.id, p.ticker, r.pred, p.hermes_expected_gain, p.qwen_expected_gain, p.true_gain_pct "
-            "FROM picks p LEFT JOIN replay_preds r ON r.pick_id = p.id AND r.version = ? AND r.kind = ? "
-            "WHERE p.true_source = 'ibkr' AND p.true_gain_pct IS NOT NULL",
+            "SELECT p.id, p.ticker, r.pred, p.hermes_expected_gain, p.qwen_expected_gain, p.true_gain_pct, "
+            f"{'p.trade_ret' if has_trade else 'NULL'} FROM picks p LEFT JOIN replay_preds r ON r.pick_id = p.id "
+            "AND r.version = ? AND r.kind = ? WHERE p.true_source = 'ibkr' AND p.true_gain_pct IS NOT NULL",
             (run["version"] if run else "", run["model_kind"] if run else "")).fetchall()
         recent = db.execute(
             "SELECT p.id, p.trade_date, p.trade_time_et, p.ticker, p.strike, p.put_call, p.expiration, p.fill_price, "
             "p.premium, p.pred_max_gain, r.pred AS replay, p.hermes_expected_gain AS hermes, p.qwen_expected_gain AS qwen, "
             "p.true_gain_pct AS real, p.true_close_pct AS close, p.pinged_utc IS NOT NULL AS pinged, c.side, c.structure, "
+            f"{'p.trade_ret' if has_trade else 'NULL'} AS trade, "
             "c.our_leg FROM picks p LEFT JOIN replay_preds r ON r.pick_id = p.id AND r.version = ? AND r.kind = ? "
             "LEFT JOIN pick_context c ON c.pick_id = p.id AND c.status = 'ok' WHERE p.score IS NOT NULL "
             + (f"AND p.ticker IN ({','.join('?' * len(MY_TICKERS))}) " if scope == "mine" else "")
@@ -344,24 +357,37 @@ def predictions(scope="mine"):
             (run["version"] if run else "", run["model_kind"] if run else "",
              *(sorted(MY_TICKERS) if scope == "mine" else []))).fetchall()
     real = [r[5] for r in graded]
+    trades = [r[6] for r in graded if r[6] is not None]
     scorecard = []
     for name, idx in (("Model (walk-forward)", 2), ("Hermes (AI judge)", 3), ("Qwen (AI judge)", 4)):
-        pairs = [(r[idx], r[5]) for r in graded if r[idx] is not None]
-        if len(pairs) < 5:
+        rows = [r for r in graded if r[idx] is not None]
+        if len(rows) < 5:
             continue
-        pairs.sort(key=lambda x: -x[0])
-        top = pairs[:max(1, len(pairs) // 5)]
-        scorecard.append({"name": name, "n": len(pairs), "rank": _rank_corr([p[0] for p in pairs], [p[1] for p in pairs]),
-                          "top_hit": _share([p[1] for p in top]), "n_top": len(top),
-                          "avg_guess": _avg([p[0] for p in pairs]), "avg_real": _avg([p[1] for p in pairs])})
-    # calibration: what really happened when the model predicted X (out-of-sample replay only)
-    buckets = [(-9, 0.0, "below 0%"), (0.0, 0.1, "0 to +10%"), (0.1, 0.2, "+10 to +20%"), (0.2, 0.3, "+20 to +30%"),
-               (0.3, 0.5, "+30 to +50%"), (0.5, 9, "+50% or more")]
+        rows.sort(key=lambda r: -r[idx])
+        top = rows[:max(1, len(rows) // 5)]
+        top_trades = [r[6] for r in top if r[6] is not None]
+        scorecard.append({"name": name, "n": len(rows),
+                          "rank": _rank_corr([r[idx] for r in rows], [r[5] for r in rows]),
+                          "rank_profit": _rank_corr([r[idx] for r in rows if r[6] is not None],
+                                                    [r[6] for r in rows if r[6] is not None]),
+                          "top_hit": _share([r[5] for r in top]), "n_top": len(top),
+                          "top_profit": _avg(top_trades), "top_win": (sum(t > 0 for t in top_trades) / len(top_trades)) if top_trades else None,
+                          "avg_guess": _avg([r[idx] for r in rows]), "avg_real": _avg([r[5] for r in rows])})
+    # calibration: what you'd really have earned per trade when the model said X (blind replay only);
+    # profit models guess the trade result itself, spike models the best gain
+    profit_model = bool(run) and _is_profit(run["model_kind"])
+    buckets = ([(-9, -0.10, "below −10%"), (-0.10, 0.0, "−10 to 0%"), (0.0, 0.05, "0 to +5%"), (0.05, 0.10, "+5 to +10%"),
+                (0.10, 0.20, "+10 to +20%"), (0.20, 9, "+20% or more")] if profit_model else
+               [(-9, 0.0, "below 0%"), (0.0, 0.1, "0 to +10%"), (0.1, 0.2, "+10 to +20%"), (0.2, 0.3, "+20 to +30%"),
+                (0.3, 0.5, "+30 to +50%"), (0.5, 9, "+50% or more")])
     calib = []
     for lo, hi, label in buckets:
-        xs = [r[5] for r in graded if r[2] is not None and lo <= r[2] < hi]
-        calib.append({"label": label, "n": len(xs), "avg_real": _avg(xs), "hit": _share(xs)})
-    scatter = [[round(r[2], 3), round(max(min(r[5], 3.0), -1.0), 3)] for r in graded if r[2] is not None]
-    return {"scope": scope, "base_hit": _share(real), "n_graded": len(graded), "scorecard": scorecard,
-            "calibration": calib, "scatter": scatter, "bar": run["ping_threshold"] if run else HIT,
-            "recent": [dict(r) for r in recent]}
+        sel = [r for r in graded if r[2] is not None and lo <= r[2] < hi]
+        ts = [r[6] for r in sel if r[6] is not None]
+        calib.append({"label": label, "n": len(sel), "avg_real": _avg([r[5] for r in sel]), "hit": _share([r[5] for r in sel]),
+                      "avg_trade": _avg(ts), "win": (sum(t > 0 for t in ts) / len(ts)) if ts else None})
+    scatter = [[round(r[2], 3), round(max(min(r[6] if profit_model else r[5], 3.0), -1.0), 3)]
+               for r in graded if r[2] is not None and (r[6] is not None or not profit_model)]
+    return {"scope": scope, "base_hit": _share(real), "base_trade": _avg(trades), "n_graded": len(graded),
+            "scorecard": scorecard, "calibration": calib, "scatter": scatter, "profit_model": profit_model,
+            "bar": run["ping_threshold"] if run else HIT, "recent": [dict(r) for r in recent]}

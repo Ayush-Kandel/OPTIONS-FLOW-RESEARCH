@@ -39,6 +39,14 @@ Trade Echo's daily bars include prices from **before** the print, which nobody f
 
 The nightly contest replays past days walk-forward (train only on earlier days, predict the next) and is graded **only on IBKR-verified outcomes**.
 
+### Judged on trading profit
+
+Predicting the spike turned out not to be the same as picking profitable trades: the spike model's guesses had +0.39 rank agreement with the best bid but **-0.01** with what a trade actually earned (volatile contracts spike *and* crash). So every pick also gets `trade_ret`: **buy at the ask right after the print, sell at +30% / -50% / the 4 PM bid, minus $0.65 per contract each way**. Every method competes twice - trained on the spike and trained on `trade_ret` (`profit:` methods) - and the contest is decided by the **average blind-test trade result** of the trades each method would take with its own "take when the guess is >= X" rule (at least 5% of the replay). On Oct 3: following every whale -19.3% per trade, the old spike model -18.4%, the winning profit-trained model -6.0% (46 trades).
+
+### More training data
+
+Whale-size raw prints ($350K+, 0-14 DTE) from the whale watch and the per-ticker polls become training picks (`source = 'whale'`, never pinged) after the close; `py flow_logger.py --whale-history` pulls the past week of them from Trade Echo's raw feed. They get IBKR prices, Greeks and both judges like any pick.
+
 ## Files
 
 | File | Purpose |
