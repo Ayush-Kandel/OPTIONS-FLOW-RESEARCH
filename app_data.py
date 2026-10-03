@@ -108,11 +108,21 @@ def _card(db, p, now):
         "bid": last_bid, "bid_at": last_m, "pnl": pct(last_bid),
         "best": best_bid, "best_at": best_m, "best_pnl": pct(best_bid),
         "model": p["pred_max_gain"], "hermes": p["hermes_expected_gain"], "qwen": p["qwen_expected_gain"],
+        # the strategy the model chose for this pick (strategies.py), when the strategy picker is live
+        "play": _strategy_name(p["pred_strategy"] if "pred_strategy" in p.keys() else None),
         "alerts": [a for a in ALERT_ORDER if a in alerts], "spark": spark,
         # whale bought / sold / mid, and whether the print was one leg of a spread (trade_context.py)
         "context": {"side": ctx["side"], "structure": ctx["structure"], "our_leg": ctx["our_leg"],
                     "quote_pos": ctx["quote_pos"]} if ctx and ctx["status"] == "ok" else None,
     }
+
+
+def _strategy_name(key):
+    if not key:
+        return None
+    import strategies
+    s = strategies.STRATEGIES.get(key)
+    return {"key": key, "name": s["name"], "about": s["about"]} if s else None
 
 
 def pings(scope="open"):

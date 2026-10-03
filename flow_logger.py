@@ -1051,6 +1051,7 @@ def run_ibkr(db):
         ibkr.price_expiries(db, deadline=deadline)
         ibkr.price_holding_days(db, deadline=deadline)
         ibkr.price_spreads(db, deadline=deadline)
+        ibkr.price_legs(db, deadline=deadline)   # spread legs of big whales, for spread strategies later
         ibkr.price_stock_iv(db, deadline=deadline)
         ibkr.price_underlyings(db, deadline=deadline)
         ibkr.refresh_greeks(db)
