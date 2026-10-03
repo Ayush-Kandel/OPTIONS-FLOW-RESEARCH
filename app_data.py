@@ -94,6 +94,8 @@ def _card(db, p, now):
             and (now.replace(tzinfo=None) - datetime.fromisoformat(last_m)).total_seconds() < 300)
     alerts = {r[0]: _minute_of(r[1]) for r in db.execute(
         "SELECT level, sent_utc FROM ib_ping_alerts WHERE pick_id = ?", (p["id"],))}
+    ctx = db.execute("SELECT status, side, structure, our_leg, quote_pos FROM pick_context WHERE pick_id = ?",
+                     (p["id"],)).fetchone()
     step = max(1, len(bids) // SPARK_POINTS)
     spark = [b for _, b in bids[::step]] + ([last_bid] if bids and (len(bids) - 1) % step else [])
     dte = (date.fromisoformat(p["expiration"]) - now.date()).days
@@ -107,6 +109,9 @@ def _card(db, p, now):
         "best": best_bid, "best_at": best_m, "best_pnl": pct(best_bid),
         "model": p["pred_max_gain"], "hermes": p["hermes_expected_gain"], "qwen": p["qwen_expected_gain"],
         "alerts": [a for a in ALERT_ORDER if a in alerts], "spark": spark,
+        # whale bought / sold / mid, and whether the print was one leg of a spread (trade_context.py)
+        "context": {"side": ctx["side"], "structure": ctx["structure"], "our_leg": ctx["our_leg"],
+                    "quote_pos": ctx["quote_pos"]} if ctx and ctx["status"] == "ok" else None,
     }
 
 
@@ -124,6 +129,20 @@ def pings(scope="open"):
     if scope == "open":   # 'open' means still tradable: drop today's expiries once the close has passed
         cards = [c for c in cards if c["state"] != "expired"]
     return {"scope": scope, "cards": cards}
+
+
+def _legs(pick_id):
+    """The other leg of a multi-leg order, as Trade Echo reported it (None for single-leg prints)."""
+    with closing(_db()) as db:
+        row = db.execute("SELECT legs_json FROM pick_context WHERE pick_id = ? AND structure IS NOT NULL",
+                         (pick_id,)).fetchone()
+    legs = json.loads(row[0]) if row and row[0] else []
+    if len(legs) < 2:
+        return None
+    o = legs[1]
+    return {"size": o.get("size"), "strike": o.get("strike_price"), "put_call": o.get("put_call"),
+            "expiration": (o.get("date_expiration") or "")[:10], "sentiment": o.get("sentiment"),
+            "time": o.get("trade_time_et")}
 
 
 def detail(pick_id):
@@ -158,6 +177,7 @@ def detail(pick_id):
         **card,
         "bids": bids, "asks": asks, "alerts_at": sorted(alerts, key=lambda a: a["minute"]),
         "line": p["line"], "score": p["score"], "flags": flags,
+        "legs": _legs(pick_id),
         # theta is per share per day; theta_dollars_day is the whole position (x 100 x size)
         "greeks": {"iv": p["iv"], "delta": p["delta"],
                    "theta_contract": p["theta"] * 100 if p["theta"] is not None else None,

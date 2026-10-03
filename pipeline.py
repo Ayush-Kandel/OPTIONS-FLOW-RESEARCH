@@ -77,6 +77,9 @@ FEATURES = ["score", "log_premium", "log_fill", "dte", "hours_to_expiry", "is_ca
             "otm_pct", "iv", "abs_delta", "theta_pct", "vega_pct", "gamma_x_spot",
             "gex_rating", "flip_dist_pct", "charm_dist_pct", "atm_iv", "n_setups",
             "repeat_30m", "flow_call_share_30m", "hermes_est", "qwen_est", "is_my_ticker", "from_algo",
+            # trade context (trade_context.py): +1 whale bought at the ask, -1 sold at the bid, 0 mid;
+            # one leg of a multi-leg order; this contract was the leg the whale SOLD
+            "side_buy", "is_multileg", "leg_sold",
             # market context from IBKR 1-minute stock bars, BEFORE the print minute only; "with"
             # = signed in the trade's direction (stock up helps a call, down helps a put)
             "stock_with_30m", "stock_with_day", "stock_range_30m", "spy_with_30m", "spy_with_day",
@@ -664,6 +667,14 @@ def features_for(db, pick_id):
         "SELECT hermes_expected_gain, qwen_expected_gain FROM picks WHERE id = ?", (pick_id,)).fetchone()
     f["is_my_ticker"] = 1.0 if ticker in MY_TICKERS else 0.0
     f["from_algo"] = 1.0 if score is None else 0.0   # Algo Edge alert rather than a noteworthy pick
+    import trade_context
+    ctx = trade_context.get(db, pick_id)
+    if ctx and ctx["status"] == "ok":
+        f["side_buy"] = {"buy": 1.0, "sell": -1.0, "mid": 0.0}[ctx["side"]]
+        f["is_multileg"] = 1.0 if ctx["structure"] else 0.0
+        f["leg_sold"] = 1.0 if ctx["our_leg"] == "sold" else 0.0
+    else:
+        f["side_buy"] = f["is_multileg"] = f["leg_sold"] = None
     sign = 1.0 if is_call else -1.0
     s30, sday, srange = _stock_context(db, ticker, trade_date, hhmm)
     p30, pday, _ = _stock_context(db, "SPY", trade_date, hhmm)
@@ -1244,6 +1255,9 @@ def pick_block(db, pick_id, with_model=False):
                                                    if theta_usd else "")
         lines.append(f"At print: IV {iv:.0%} · Δ {delta:.2f} · Γ {gamma:.4f} · {theta_txt} · "
                      f"Vega ${vega * 100:.2f}")
+    if with_model:
+        import trade_context
+        lines.append(trade_context.describe(trade_context.get(db, pick_id)))
     if with_model and pred is not None:
         lines.append(f"Model: expected best gain today **{pred:+.0%}**")
     d = datetime.strptime(tdate, "%Y-%m-%d")
@@ -1305,6 +1319,13 @@ def maybe_ping(db, pick_id, et_now):
     h, m = (int(x) for x in hhmm.split(":"))
     if (et_now.hour * 60 + et_now.minute) - (h * 60 + m) > PING_MAX_AGE_MIN:
         return False
+    import trade_context
+    ctx = trade_context.get(db, pick_id)
+    if trade_context.whale_sold(ctx):
+        # following would mean buying what the whale sold (a bid-side print, or the sold leg of a spread)
+        print(f"{et_now:%H:%M:%S} NO PING {ticker}: the whale SOLD this contract "
+              f"({ctx['structure'] or 'at the bid'})")
+        return False
     replay = bundle.get("replay") or {}
     hit = replay.get("hit")
     footer = (f"_Method: {bundle.get('kind', '?')}, trained on {bundle.get('n', '?')} picks"
@@ -1319,8 +1340,9 @@ def maybe_ping(db, pick_id, et_now):
 
 # ------------------------------------------------------------- workflows --
 
-def handle_new_picks(db, pick_ids, live):
-    """Live: picks on your tickers get the judges the winning method needs, a model estimate and
+def handle_new_picks(db, pick_ids, live, call=None):
+    """Live: picks on your tickers get their trade context (bought/sold, spread legs - via `call`,
+    which never waits for credits), the judges the winning method needs, a model estimate and
     maybe a ping right away; the other judge runs after. Other tickers' picks are stored for
     training and judged after the close. Not live: everything is judged in one batch."""
     et_now = _et()
@@ -1333,7 +1355,13 @@ def handle_new_picks(db, pick_ids, live):
         return
     mine = mine_only(db, pick_ids)
     needed = judges_needed()
+    import trade_context
     for pid in mine:
+        if call is not None:
+            try:
+                trade_context.check(db, call, pid)
+            except Exception as e:   # no credit room right now or a server error: checked tonight
+                print(f"{et_now:%H:%M:%S} trade context skipped for pick {pid}: {type(e).__name__}: {e}")
         for name in needed:
             judge(db, pid, name)
         pred = score_pick(db, pid)
@@ -1341,9 +1369,11 @@ def handle_new_picks(db, pick_ids, live):
         ticker, contract, hhmm, fill, score, iv, h, q = db.execute(
             "SELECT ticker, contract, trade_time_et, fill_price, score, iv, hermes_expected_gain, "
             "qwen_expected_gain FROM picks WHERE id = ?", (pid,)).fetchone()
+        ctx = trade_context.get(db, pid) or {}
         print(f"{et_now:%H:%M:%S} PICK   {ticker} {contract} @ {fill} ({hhmm} ET, {_score_txt(score)}) "
               f"IV={f'{iv:.0%}' if iv else '-'} model={f'{pred:+.0%}' if pred is not None else '-'} "
-              f"hermes={f'{h:+.0%}' if h is not None else '-'} qwen={f'{q:+.0%}' if q is not None else '-'}"
+              f"hermes={f'{h:+.0%}' if h is not None else '-'} qwen={f'{q:+.0%}' if q is not None else '-'} "
+              f"side={ctx.get('side') or '?'}{' ' + ctx['structure'] if ctx.get('structure') else ''}"
               f"{' PINGED' if pinged else ''}")
     for pid in mine:  # the remaining judge, after any pings have gone out
         for name in JUDGES:
@@ -1390,6 +1420,8 @@ def run_after_close(db, call, trade_date):
         ibkr.price_underlyings(db)
         ibkr.price_stock_iv(db)
         ibkr.refresh_greeks(db)
+        import trade_context
+        trade_context.update_quote_positions(db)   # IBKR bid/ask cross-check of each whale's side
     except Exception as e:
         print(f"IBKR pricing failed: {type(e).__name__}: {e} - training on what's there")
         discord_send(f"🛑 **Nightly IBKR pricing failed** ({type(e).__name__}). Today's picks have no honest "

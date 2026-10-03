@@ -27,6 +27,8 @@ const GLOSSARY = {
   judges: ["AI judges", "Two AI models running on this PC (Hermes and Qwen) that read each trade and guess its upside. They are still learning and are less accurate than the model."],
   alerts: ["Alerts", "Discord alerts that fired the first time the bid crossed +30%, +50%, +100% or -50% from the whale's price."],
   latency: ["Ping delay", "How long after the whale's trade our ping went out. By then the price may already have moved."],
+  side: ["Bought or sold?", "Whether the whale was BUYING (paid the ask) or SELLING (hit the bid). Following only makes sense when the whale bought. From Trade Echo's trade sentiment, cross-checked with IBKR's own bid/ask at that minute."],
+  spreadleg: ["Spread leg", "The whale traded another contract in the same second with a matching size: one multi-leg order (a vertical spread, calendar, collar...). Its real bet is the combination, not this contract alone. If this was the leg the whale SOLD, no ping is sent."],
   score: ["Flow score", "Trade Echo's 0-100 rating of how unusual and aggressive the trade was. We only consider trades above 30."],
 };
 
@@ -96,6 +98,14 @@ function spark(values, fill, up) {
     <polyline points="${pts}" style="fill:none;stroke:${up ? "var(--green)" : "var(--red)"};stroke-width:2" vector-effect="non-scaling-stroke"/></svg>`;
 }
 
+function contextChips(ctx) {
+  if (!ctx) return '<div class="chips"><span class="chip" data-tip="side">Bought/sold: not checked yet</span></div>';
+  const side = { buy: ["hit", "Whale BOUGHT (at ask)"], sell: ["hit neg", "Whale SOLD (at bid)"], mid: ["", "Traded mid (unclear)"] }[ctx.side];
+  let html = `<span class="chip ${side[0]}" data-tip="side">${side[1]}</span>`;
+  if (ctx.structure) html += `<span class="chip ${ctx.our_leg === "sold" ? "hit neg" : ""}" data-tip="spreadleg">🧩 ${esc(ctx.structure)} · leg ${esc(ctx.our_leg)}</span>`;
+  return `<div class="chips">${html}</div>`;
+}
+
 function cardHTML(c) {
   const stateTag = c.state === "live" ? '<span class="state live"><span class="dot"></span>LIVE</span>'
     : c.state === "expired" ? '<span class="state">Expired</span>' : '<span class="state">Market closed</span>';
@@ -108,7 +118,8 @@ function cardHTML(c) {
       ${stateTag}
     </div>
     <div class="expiry">${expiryText(c)}</div>
-    <div class="whale">Whale bought <b>${Number(c.size).toLocaleString()}</b> at <b>${money(c.fill)}</b> · ${day(c.trade_date)} ${clock(c.trade_date + " " + c.time)} · ${bigMoney(c.premium)}</div>
+    <div class="whale">Whale traded <b>${Number(c.size).toLocaleString()}</b> at <b>${money(c.fill)}</b> · ${day(c.trade_date)} ${clock(c.trade_date + " " + c.time)} · ${bigMoney(c.premium)}</div>
+    ${contextChips(c.context)}
     <div class="pnl-row">
       <span class="pnl ${tone(c.pnl)}" data-tip="pnl">${pct(c.pnl)}</span>
       <span class="bidnow">${label}<br><b>${money(c.bid)}</b></span>
@@ -224,6 +235,20 @@ function storyHTML(d) {
   const s = [`On <b>${day(d.trade_date)} at ${clock(start)}</b>, a whale bought <b>${Number(d.size).toLocaleString()}</b> contracts of
     <b>${esc(name(d))}</b> at <b>${money(d.fill)}</b> each (${bigMoney(d.premium)} in total).`];
   if (d.flags.length) s.push(`The trade was ${d.flags.map(f => FLAG_WORDS[f] || esc(f.replace(/_/g, " "))).join(" and ")}.`);
+  if (d.context) {
+    const c = d.context, q = c.quote_pos;
+    const where = q == null ? "" : q <= 0 ? " IBKR's quote that minute puts the fill at or below the bid."
+      : q >= 1 ? " IBKR's quote that minute puts the fill at or above the ask."
+      : ` IBKR's quote that minute puts the fill ${Math.round(q * 100)}% of the way from bid to ask.`;
+    s.push({
+      buy: `Trade Echo marks it as a <b class="up">buy at the ask</b> - an aggressive buyer.`,
+      sell: `Trade Echo marks it as a <b class="down">sale at the bid</b> - the whale was SELLING, so following it means taking the other side.`,
+      mid: `It traded <b>between the bid and the ask</b>, so whether the whale bought or sold is unclear.`,
+    }[c.side] + where);
+    if (c.structure && d.legs) s.push(`🧩 It was one leg of a <b>${esc(c.structure)}</b>: in the same second the whale also traded
+      ${Number(d.legs.size).toLocaleString()} × ${strike(d.legs.strike)} ${pcWord(d.legs.put_call)} ${day(d.legs.expiration)}
+      (${esc((d.legs.sentiment || "").toLowerCase())}). This contract was the leg <b>${esc(c.our_leg)}</b>.`);
+  }
   if (d.whale_watch) {
     const w = d.whale_watch, secs = Math.round((Date.parse(w.seen.replace(" ", "T") + "Z") -
       Date.parse(d.trade_date + "T" + w.trade_time + "Z")) / 1000);

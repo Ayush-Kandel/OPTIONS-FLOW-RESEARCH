@@ -20,3 +20,4 @@ venv/
 # Secrets never live in files, but just in case
 .env
 *.env
+context_backfill.log

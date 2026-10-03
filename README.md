@@ -49,6 +49,7 @@ The nightly contest replays past days walk-forward (train only on earlier days, 
 | `bots.py` | Simulator (backtests + exit-plan grid), Analyst, Judges report, Scout |
 | `integrity.py` | 27 rule-based data-integrity checks + a local Qwen audit whose findings are re-verified by code |
 | `flow_app.py`, `app_data.py`, `ui/` | **FlowDesk** desktop app: live P&L of every ping since the whale's fill, per-contract charts, model vs. reality (read-only) |
+| `trade_context.py` | Was the whale buying (ask) or selling (bid)? Was the print one leg of a spread/collar? No ping when the whale sold |
 | `cases.py` | Incident cases: evidence -> local Qwen investigation -> verified write-up in `cases/` + Discord |
 | `dashboard.py` | Operator dashboard at http://localhost:8050 (what every bot is doing) |
 | `greeks.py` | Black-Scholes IV and Greeks (no API calls) |
