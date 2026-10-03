@@ -6,6 +6,7 @@ whale's fill at the print time to the best BID (the price you could actually sel
 """
 
 import json
+import os
 import sqlite3
 from contextlib import closing
 from datetime import date, datetime, timezone
@@ -13,7 +14,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 ET = ZoneInfo("America/New_York")
-DB = Path(__file__).parent / "flow.db"
+DB = Path(os.environ.get("FLOW_DB") or Path(__file__).parent / "flow.db")
 ALERT_ORDER = ["+30%", "+50%", "+100%", "-50%"]
 SPARK_POINTS = 80
 

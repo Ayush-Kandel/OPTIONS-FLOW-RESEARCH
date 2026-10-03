@@ -770,7 +770,11 @@ document.addEventListener("mousemove", e => {
 // ---------- start ----------
 renderHelp();
 loadHealth();
-loadList();
+// deep links: #lab, #contest, #learning, #predictions, #help or #pick/<id> open that screen directly
+const deep = location.hash.slice(1);
+if (deep.startsWith("pick/")) openDetail(deep.slice(5));
+else if (LOADERS[deep] || deep === "help") { showView(deep); (LOADERS[deep] || (() => {}))(); }
+else loadList();
 setInterval(() => {
   loadHealth();
   if (state.view === "live") loadList();
