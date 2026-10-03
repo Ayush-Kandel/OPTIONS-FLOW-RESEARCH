@@ -458,9 +458,12 @@ def _now():
 
 
 def _data_key(db):
+    """Changes whenever graded data, the strategy replays or the model's blind guesses change."""
+    has_sr = db.execute("SELECT 1 FROM sqlite_master WHERE name = 'strategy_results'").fetchone()
     return "|".join(str(x) for x in db.execute(
-        "SELECT COUNT(*), MAX(id), (SELECT MAX(computed_utc) FROM strategy_results), "
-        "(SELECT MAX(version) FROM replay_preds) FROM picks WHERE true_source = 'ibkr'").fetchone())
+        "SELECT COUNT(*), MAX(id), "
+        + ("(SELECT MAX(computed_utc) FROM strategy_results)" if has_sr else "NULL")
+        + ", (SELECT MAX(version) FROM replay_preds) FROM picks WHERE true_source = 'ibkr'").fetchone())
 
 
 def strategy_text(names, combo, col):
@@ -538,7 +541,10 @@ def _idle_priority():
     """Only use CPU nothing else wants (the logger, IBKR tracker and judges always come first)."""
     if sys.platform == "win32":
         import ctypes
-        ctypes.windll.kernel32.SetPriorityClass(ctypes.windll.kernel32.GetCurrentProcess(), 0x40)  # IDLE_PRIORITY_CLASS
+        k = ctypes.windll.kernel32
+        k.GetCurrentProcess.restype = ctypes.c_void_p          # a 64-bit handle: don't let ctypes cut it to 32 bits
+        k.SetPriorityClass.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        k.SetPriorityClass(k.GetCurrentProcess(), 0x40)        # IDLE_PRIORITY_CLASS (workers inherit it)
 
 
 def daemon():
