@@ -173,14 +173,16 @@ def describe(ctx):
 
 def backfill(db, call, deadline=None, limit=None, log=print):
     """Context for picks that don't have it yet (2 credits each): IBKR-graded picks and your
-    tickers first, newest first. Stops at `deadline` (epoch)."""
+    tickers first, newest first. Stops at `deadline` (epoch). Algo Edge alerts are skipped: their
+    trades aren't in Trade Echo's raw flow feed (0 of 6 matched on Oct 2), so asking costs credits
+    for nothing."""
     import time
     import pipeline
     ensure_schema(db)
     marks = ",".join("?" * len(pipeline.MY_TICKERS))
     todo = [r[0] for r in db.execute(
         f"SELECT p.id FROM picks p LEFT JOIN pick_context c ON c.pick_id = p.id "
-        f"WHERE (c.pick_id IS NULL OR c.status = 'error') AND p.strike IS NOT NULL "
+        f"WHERE (c.pick_id IS NULL OR c.status = 'error') AND p.strike IS NOT NULL AND p.source != 'algo' "
         f"ORDER BY p.true_source = 'ibkr' DESC, p.ticker IN ({marks}) DESC, p.trade_date DESC, p.trade_time_et DESC",
         tuple(sorted(pipeline.MY_TICKERS))).fetchall()][:limit]
     log(f"Trade context: {len(todo)} picks to check (~{2 * len(todo)} credits)")
