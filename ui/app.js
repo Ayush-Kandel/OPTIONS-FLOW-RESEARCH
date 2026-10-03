@@ -27,6 +27,7 @@ const GLOSSARY = {
   judges: ["AI judges", "Two AI models running on this PC (Hermes and Qwen) that read each trade and guess its upside. They are still learning and are less accurate than the model."],
   alerts: ["Alerts", "Discord alerts that fired the first time the bid crossed +30%, +50%, +100% or -50% from the whale's price."],
   latency: ["Ping delay", "How long after the whale's trade our ping went out. By then the price may already have moved."],
+  tradeResult: ["As a trade", "What following this whale really earned: buy at the ask right after its trade, sell when the bid hits +30% or −50%, otherwise at 4 PM, after $0.65/contract fees each way. This is what the model is now trained and judged on."],
   walkforward: ["Walk-forward test", "The honest way to backtest: to judge Wednesday, the model is trained only on Monday and Tuesday, then predicts Wednesday's picks blind. No peeking at the future."],
   rank: ["Rank agreement", "Does the model put the picks in the right order, from worst to best? 0 means random guessing, 1 means a perfect order. Anything steadily above 0.2 is useful for trading."],
   side: ["Bought or sold?", "Whether the whale was BUYING (paid the ask) or SELLING (hit the bid). Following only makes sense when the whale bought. From Trade Echo's trade sentiment, cross-checked with IBKR's own bid/ask at that minute."],
@@ -387,23 +388,35 @@ async function loadLearning() {
   try {
     const L = await api("learning");
     const x = L.latest;
-    $("#learnStats").innerHTML = x ? `
+    const byProfit = x && x.profit != null;
+    $("#learnStats").innerHTML = !x ? "" : byProfit ? `
+      <div class="stat"><div class="label">Picks it learned from</div><div class="value">${x.n}</div><div class="sub">graded on real IBKR prices</div></div>
+      <div class="stat"><div class="label">Tonight's winner</div><div class="value" style="font-size:18px">${esc(kindName(x.kind))}</div><div class="sub">${x.profit_model ? "trained on real trade profit" : "trained on the spike"}</div></div>
+      <div class="stat"><div class="label">Its picks, tested blind</div><div class="value ${tone(x.profit)}">${pct(x.profit)}</div><div class="sub">per trade after fees · ${x.n_pings} trades</div></div>
+      <div class="stat"><div class="label">Following every whale</div><div class="value ${tone(x.base_profit)}">${pct(x.base_profit)}</div><div class="sub">per trade, same rules</div></div>` : `
       <div class="stat"><div class="label">Picks it learned from</div><div class="value">${x.n}</div><div class="sub">graded on real IBKR prices</div></div>
       <div class="stat"><div class="label" data-tip="rank">Rank agreement (tested blind)</div><div class="value">${x.rank != null ? x.rank.toFixed(2) : "—"}</div><div class="sub">0 = random, 1 = perfect</div></div>
       <div class="stat"><div class="label">The model's picks that won</div><div class="value up">${pct(x.hit).replace("+", "")}</div><div class="sub">of ${x.n_pings} picks it would ping</div></div>
-      <div class="stat"><div class="label">All picks that won</div><div class="value">${pct(x.base).replace("+", "")}</div><div class="sub">${x.base ? (x.hit / x.base).toFixed(1) + "× better when the model chooses" : ""}</div></div>` : "";
+      <div class="stat"><div class="label">All picks that won</div><div class="value">${pct(x.base).replace("+", "")}</div><div class="sub">${x.base ? (x.hit / x.base).toFixed(1) + "× better when the model chooses" : ""}</div></div>`;
     draw("historyChart", { type: "line", data: {
       labels: L.runs.map(r => runTime(r.run_utc)),
       datasets: [
-        { label: "Model's picks that won", data: L.runs.map(r => r.hit), borderColor: "#3fb950", backgroundColor: "#3fb950", tension: .25 },
-        { label: "All picks that won", data: L.runs.map(r => r.base), borderColor: "#8b949e", backgroundColor: "#8b949e", borderDash: [5, 4], tension: .25 },
-      ] }, options: { scales: { y: pctAxis({ min: 0 }) }, plugins: { tooltip: { callbacks: { label: c => `${c.dataset.label}: ${pct(c.raw).replace("+", "")}` } } } } });
-    const board = [...L.board].sort((a, b) => (b.spearman ?? -1) - (a.spearman ?? -1));
+        { label: "Model's picks: result per trade", data: L.runs.map(r => r.profit), borderColor: "#3fb950", backgroundColor: "#3fb950", tension: .25, spanGaps: true },
+        { label: "Every whale: result per trade", data: L.runs.map(r => r.base_profit), borderColor: "#8b949e", backgroundColor: "#8b949e", borderDash: [5, 4], tension: .25, spanGaps: true },
+        { label: "Model's picks that reached +30%", data: L.runs.map(r => r.hit), borderColor: "#58a6ff", backgroundColor: "#58a6ff", tension: .25, hidden: byProfit },
+      ] }, options: { scales: { y: pctAxis() }, plugins: { tooltip: { callbacks: { label: c => `${c.dataset.label}: ${pct(c.raw)}` } } } } });
+    // older contests (before profit judging) only have rank agreement
+    const hasProfit = L.board.some(b => b.profit_avg != null);
+    const metric = b => (hasProfit ? b.profit_avg : b.spearman) ?? null;
+    const board = [...L.board].filter(b => metric(b) != null).sort((a, b) => metric(b) - metric(a)).slice(0, 12);
     draw("boardChart", { type: "bar", data: {
-      labels: board.map(b => kindName(b.kind)),
-      datasets: [{ label: "Rank agreement", data: board.map(b => b.spearman),
-        backgroundColor: board.map(b => b.kind === L.winner ? "#3fb950" : "#30598f") }] },
-      options: { indexAxis: "y", plugins: { legend: { display: false } }, scales: { x: { min: 0 } } } });
+      labels: board.map(b => kindName(b.kind.replace("profit:", "")) + (b.kind.startsWith("profit:") ? " (profit-trained)" : "")),
+      datasets: [{ label: "Result per trade (blind)", data: board.map(metric),
+        backgroundColor: board.map(b => b.kind === L.winner ? "#3fb950" : metric(b) >= 0 ? "#2f7a43" : "#30598f") }] },
+      options: { indexAxis: "y", plugins: { legend: { display: false }, tooltip: { callbacks: {
+        label: c => { const b = board[c.dataIndex]; return hasProfit ? `${pct(b.profit_avg)} per trade over ${b.n_pings} trades (takes when its guess ≥ ${pct(b.threshold)})`
+          : `rank agreement ${(b.spearman ?? 0).toFixed(2)}`; } } } },
+        scales: { x: hasProfit ? pctAxis() : { min: 0 } } } });
     draw("replayChart", { type: "bar", data: {
       labels: L.replay.map(d => dayShort(d.day)),
       datasets: [
@@ -564,29 +577,32 @@ async function loadPredictions() {
     const P = await api("predictions", { scope: predScope });
     $("#scorecard").innerHTML = P.scorecard.map(s => `
       <div class="stat"><div class="label">${esc(s.name)}</div>
-        <div class="value">${s.rank != null ? s.rank.toFixed(2) : "—"} <span class="muted" style="font-size:13px;font-weight:400" data-tip="rank">rank agreement</span></div>
-        <div class="sub">Its top ${s.n_top} picks: <b class="${s.top_hit > P.base_hit ? "up" : ""}">${pct(s.top_hit).replace("+", "")} won</b> (all picks: ${pct(P.base_hit).replace("+", "")})</div>
-        <div class="sub">Average guess ${pct(s.avg_guess)} · reality ${pct(s.avg_real)}</div></div>`).join("");
+        <div class="value">${s.rank_profit != null ? s.rank_profit.toFixed(2) : "—"} <span class="muted" style="font-size:13px;font-weight:400" data-tip="rank">rank agreement with real trade profit</span></div>
+        <div class="sub">Its top ${s.n_top} picks as trades: <b class="${tone(s.top_profit)}">${pct(s.top_profit)} per trade</b>, won ${pct(s.top_win).replace("+", "")}
+          (every whale: ${pct(P.base_trade)})</div>
+        <div class="sub">Spike: rank ${s.rank != null ? s.rank.toFixed(2) : "—"} · top picks reached +30%: ${pct(s.top_hit).replace("+", "")}</div></div>`).join("");
     draw("calibChart", { data: { labels: P.calibration.map(c => c.label), datasets: [
-      { type: "bar", label: "Became winners", data: P.calibration.map(c => c.hit), backgroundColor: P.calibration.map(c => c.hit > P.base_hit ? "#3fb950" : "#4b5563") },
-      { type: "line", label: "All picks", data: P.calibration.map(() => P.base_hit), borderColor: "#d29922", borderDash: [5, 4], pointRadius: 0 },
-    ] }, options: { scales: { y: pctAxis({ min: 0 }), x: { title: { display: true, text: "the model's guess" } } },
-      plugins: { tooltip: { callbacks: { label: c => c.datasetIndex ? `All picks: ${pct(c.raw).replace("+", "")} won`
-        : `${pct(c.raw).replace("+", "")} won (${P.calibration[c.dataIndex].n} picks)` } } } } });
+      { type: "bar", label: "Result per trade", data: P.calibration.map(c => c.avg_trade), backgroundColor: P.calibration.map(c => (c.avg_trade ?? 0) >= 0 ? "#3fb950" : "#f85149") },
+      { type: "line", label: "Following every whale", data: P.calibration.map(() => P.base_trade), borderColor: "#d29922", borderDash: [5, 4], pointRadius: 0 },
+    ] }, options: { scales: { y: pctAxis(), x: { title: { display: true, text: P.profit_model ? "the model's guess (expected trade result)" : "the model's guess (expected best gain)" } } },
+      plugins: { tooltip: { callbacks: { label: c => c.datasetIndex ? `Every whale: ${pct(c.raw)} per trade`
+        : `${pct(c.raw)} per trade, won ${pct(P.calibration[c.dataIndex].win).replace("+", "")} (${P.calibration[c.dataIndex].n} picks)` } } } } });
     draw("scatterChart", { type: "scatter", data: { datasets: [{ data: P.scatter.map(([x, y]) => ({ x, y })), pointRadius: 2.5,
-      backgroundColor: P.scatter.map(([, y]) => y >= 0.3 ? "rgba(63,185,80,.7)" : "rgba(139,148,158,.5)") }] },
+      backgroundColor: P.scatter.map(([, y]) => (P.profit_model ? y > 0 : y >= 0.3) ? "rgba(63,185,80,.7)" : "rgba(139,148,158,.5)") }] },
       options: { plugins: { legend: { display: false }, tooltip: { callbacks: { label: c => `guess ${pct(c.raw.x)} → real ${pct(c.raw.y)}` } } },
-        scales: { x: pctAxis({ title: { display: true, text: "model's guess" } }), y: pctAxis({ title: { display: true, text: "best bid after the trade" } }) } } });
+        scales: { x: pctAxis({ title: { display: true, text: "model's guess" } }),
+          y: pctAxis({ title: { display: true, text: P.profit_model ? "real trade result" : "best bid after the trade" } }) } } });
     const sideTxt = r => r.side ? ({ buy: '<span class="chip hit">bought</span>', sell: '<span class="chip hit neg">sold</span>', mid: '<span class="chip">mid</span>' }[r.side]
       + (r.structure ? ` <span class="chip ${r.our_leg === "sold" ? "hit neg" : ""}">🧩 ${esc(r.structure)}</span>` : "")) : '<span class="muted">—</span>';
     $("#predTable").innerHTML = `<tr><th>When</th><th>Contract</th><th data-tip="side">Whale</th><th class="num" data-tip="model">Model</th>
-      <th class="num" data-tip="judges">Hermes</th><th class="num" data-tip="judges">Qwen</th><th class="num" data-tip="best">Real best</th><th>Result</th></tr>` +
+      <th class="num" data-tip="judges">Hermes</th><th class="num" data-tip="judges">Qwen</th><th class="num" data-tip="best">Real best</th>
+      <th class="num" data-tip="tradeResult">As a trade</th><th>Result</th></tr>` +
       P.recent.map(r => { const m = r.replay ?? r.pred_max_gain;
         const res = r.real == null ? '<span class="muted">pending</span>' : r.real >= 0.3 ? "✅ winner" : '<span class="muted">no</span>';
         return `<tr class="click" data-id="${r.id}"><td>${dayShort(r.trade_date)} ${clock(r.trade_date + " " + r.trade_time_et)}</td>
           <td>${esc(r.ticker)} ${strike(r.strike)} ${pcWord(r.put_call)} ${esc(r.expiration.slice(5))}${r.pinged ? " 🔔" : ""}</td>
           <td>${sideTxt(r)}</td><td class="num">${pct(m)}</td><td class="num">${pct(r.hermes)}</td><td class="num">${pct(r.qwen)}</td>
-          <td class="num ${tone(r.real)}">${pct(r.real)}</td><td>${res}</td></tr>`; }).join("");
+          <td class="num ${tone(r.real)}">${pct(r.real)}</td><td class="num ${tone(r.trade)}">${pct(r.trade)}</td><td>${res}</td></tr>`; }).join("");
   } catch (e) {
     $("#scorecard").innerHTML = `<div class="error">Couldn't load: ${esc(e.message)}</div>`;
   }

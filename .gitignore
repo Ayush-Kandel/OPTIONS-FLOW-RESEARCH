@@ -21,3 +21,4 @@ venv/
 .env
 *.env
 context_backfill.log
+whale_history.log
