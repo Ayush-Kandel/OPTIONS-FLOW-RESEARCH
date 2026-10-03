@@ -136,6 +136,20 @@ EXTRA_COLUMNS = {
     "ib_entries": {"open_interest": "REAL"},
 }
 
+# Index option classes are listed under their index's symbol (an NDXP option is an NDX option of
+# class NDXP); asking IBKR for symbol 'NDXP' finds nothing (50 picks were 'no_contract' on Oct 2).
+INDEX_CLASSES = {"SPXW": "SPX", "SPX": "SPX", "NDXP": "NDX", "NDX": "NDX", "RUTW": "RUT", "RUT": "RUT",
+                 "XSP": "XSP", "VIXW": "VIX", "VIX": "VIX"}
+
+
+def _option(ticker, exp, strike, put_call):
+    from ib_async import Option
+    parent = INDEX_CLASSES.get(ticker)
+    if parent:
+        return Option(parent, exp.replace("-", ""), strike, put_call[0], "SMART", currency="USD",
+                      tradingClass=ticker)
+    return Option(ticker, exp.replace("-", ""), strike, put_call[0], "SMART", currency="USD")
+
 
 def ensure_schema(db):
     db.executescript(SCHEMA)
@@ -288,7 +302,7 @@ def price_spreads(db, deadline=None, log=print):
         for pid, ticker, strike, pc, exp, tdate, hhmm in todo:
             if deadline and time.time() > deadline or not ib.data_ok():
                 break
-            c = Option(ticker, exp.replace("-", ""), strike, pc[0], "SMART", currency="USD")
+            c = _option(ticker, exp, strike, pc)
             if ib.call("qualifyContracts", c) and c.conId:
                 _price_spread(db, ib, pid, c, date.fromisoformat(tdate), f"{tdate} {hhmm}")
                 done += 1
@@ -333,7 +347,7 @@ def price_holding_days(db, deadline=None, log=print):
             if deadline and time.time() > deadline or not ib.data_ok():
                 log(f"IBKR: holding days stopped at {n}/{len(todo)} - the rest continues next run")
                 break
-            c = Option(tk, exp.replace("-", ""), k, pc[0], "SMART", currency="USD")
+            c = _option(tk, exp, k, pc)
             if not (ib.call("qualifyContracts", c) and c.conId):
                 continue
             days = min(HOLD_MAX_DAYS, max(1, (last_day - date.fromisoformat(start)).days + 1))
@@ -386,7 +400,7 @@ class LiveQuotes:
             self.ib.call("reqMarketDataType", 1)
         for key in new:
             tk, k, pc, exp = key
-            c = Option(tk, exp.replace("-", ""), k, pc[0], "SMART", currency="USD")
+            c = _option(tk, exp, k, pc)
             if self.ib.call("qualifyContracts", c) and c.conId:
                 self.streams[key] = (c, self.ib.call("reqMktData", c, "100,106", False, False))
         return len(self.streams)
@@ -536,7 +550,7 @@ def snapshot_open_interest(db, ib=None, only_today_picks=False, log=print):
             items = []
             for key in rows[i:i + OI_BATCH]:
                 ticker, strike, pc, exp = key
-                c = Option(ticker, exp.replace("-", ""), strike, pc[0], "SMART", currency="USD")
+                c = _option(ticker, exp, strike, pc)
                 if ib.call("qualifyContracts", c) and c.conId:
                     items.append((c, key))
             if items:
@@ -626,7 +640,7 @@ def price_expiries(db, deadline=None, log=print):
                     bids = [tuple(r) for r in db.execute(q, (pid, "BID"))]
                 else:
                     if key not in contracts:
-                        c = Option(ticker, exp.replace("-", ""), strike, pc[0], "SMART", currency="USD")
+                        c = _option(ticker, exp, strike, pc)
                         contracts[key] = c if ib.call("qualifyContracts", c) and c.conId else None
                     c = contracts[key]
                     if c is None:
@@ -720,7 +734,7 @@ def record_entries(db, ib, contracts, log=print):
                    delay_sec=(now_utc - datetime.fromisoformat(pinged)).total_seconds())
         c = contracts.get(("OPT", pid))
         if c is None:
-            c = Option(ticker, exp.replace("-", ""), strike, pc[0], "SMART", currency="USD")
+            c = _option(ticker, exp, strike, pc)
             c = c if ib.call("qualifyContracts", c) and c.conId else None
             contracts[("OPT", pid)] = c
         if c is None:
@@ -837,7 +851,7 @@ def run_live(db, in_session, next_open, my_tickers, log=print):
             for pid, ticker, strike, pc, exp in picks:
                 key = ("OPT", pid)
                 if key not in contracts:
-                    c = Option(ticker, exp.replace("-", ""), strike, pc[0], "SMART", currency="USD")
+                    c = _option(ticker, exp, strike, pc)
                     contracts[key] = c if ib.call("qualifyContracts", c) and c.conId else None
                 if contracts[key]:
                     _store_today(db, ib, contracts[key], "TRADES", pick_id=pid)
@@ -938,10 +952,14 @@ def _price_pick(db, ib, pick):
         db.commit()
         return status
 
-    if date.fromisoformat(exp) < datetime.now(ET).date():
+    expired = date.fromisoformat(exp) < datetime.now(ET).date()
+    if expired and date.fromisoformat(exp) < datetime.now(ET).date() - timedelta(days=1):
         return save("expired", "IBKR has no data for expired options")
-    c = Option(ticker, exp.replace("-", ""), strike, pc[0], "SMART", currency="USD")
+    # a contract that expired yesterday is often still listed for a few hours after midnight
+    c = _option(ticker, exp, strike, pc)
     if not ib.call("qualifyContracts", c) or not c.conId:
+        if expired:
+            return save("expired", "IBKR has no data for expired options")
         return save("no_contract", f"IBKR doesn't list {ticker} {strike:g}{pc[0]} {exp}")
     td = date.fromisoformat(tdate)
     trades, bids = _bars(ib, c, td, "TRADES"), _bars(ib, c, td, "BID")
@@ -1006,7 +1024,8 @@ def price_picks(db, only_missing=True, deadline=None, log=print):
         "SELECT p.id, p.ticker, p.strike, p.put_call, p.expiration, p.trade_date, p.trade_time_et, p.fill_price "
         "FROM picks p LEFT JOIN ib_stats s ON s.pick_id = p.id WHERE p.trade_date <= ? AND p.expiration >= ? "
         + ("AND (s.pick_id IS NULL OR s.status IN ('error', 'partial')) " if only_missing else "")
-        + "ORDER BY p.trade_date, p.trade_time_et", (last_day.isoformat(), today.date().isoformat())).fetchall()
+        + "ORDER BY p.trade_date, p.trade_time_et",
+        (last_day.isoformat(), (today.date() - timedelta(days=1)).isoformat())).fetchall()
     if not picks:
         log("IBKR: no picks to price")
         return {}
