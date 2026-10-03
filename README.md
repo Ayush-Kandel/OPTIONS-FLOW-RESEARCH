@@ -43,6 +43,14 @@ The nightly contest replays past days walk-forward (train only on earlier days, 
 
 Predicting the spike turned out not to be the same as picking profitable trades: the spike model's guesses had +0.39 rank agreement with the best bid but **-0.01** with what a trade actually earned (volatile contracts spike *and* crash). So every pick also gets `trade_ret`: **buy at the ask right after the print, sell at +30% / -50% / the 4 PM bid, minus $0.65 per contract each way**. Every method competes twice - trained on the spike and trained on `trade_ret` (`profit:` methods) - and the contest is decided by the **average blind-test trade result** of the trades each method would take with its own "take when the guess is >= X" rule (at least 5% of the replay). On Oct 3: following every whale -19.3% per trade, the old spike model -18.4%, the winning profit-trained model -6.0% (46 trades).
 
+### Strategy library and the strategy picker
+
+`strategies.py` replays every graded pick under eight ways of trading it, all buying at the ask right after the whale and graded on real IBKR bars (after fees): **Standard** (+30% / -50% / 4 PM), **Quick scalp** (+15% / -15% / 30 min), **Runner** (+100% / -40%), **Trailing stop** (after +20%, sell 15% off the best bid), **One-hour hold**, **Out by 2 PM**, **Hold overnight** (sell at the next 10 AM bid) and **Hold to expiry**. A strategy with no recorded prices for a pick (no next-day bars, expiry not reached) has no result - nothing is priced by formula.
+
+`picker:` models train one regressor per strategy and trade each pick with its best predicted strategy (or skip it). In the walk-forward replay a strategy's result is only used for training once its trade had **closed before the day being predicted** (a hold-to-expiry result can arrive days later), and whales that sold are never taken, exactly like live pings. Pings name the chosen play. Hermes and Qwen get the playbook, each strategy's results on similar earlier trades and their own trading record, and choose a strategy with every take/skip; their Contest accounts trade their choice. On Oct 3 the strategy picker was the first method with a positive blind-test result: +1.4% per trade over 88 trades (within noise for now).
+
+`ibkr.price_legs()` records the real 1-minute bid/ask of each big whale's companion contracts (next strike out, next expiry, the other side) every night, so vertical, calendar and straddle strategies can be added once enough days are recorded.
+
 ### More training data
 
 Whale-size raw prints ($350K+, 0-14 DTE) from the whale watch and the per-ticker polls become training picks (`source = 'whale'`, never pinged) after the close; `py flow_logger.py --whale-history` pulls the past week of them from Trade Echo's raw feed. They get IBKR prices, Greeks and both judges like any pick.
