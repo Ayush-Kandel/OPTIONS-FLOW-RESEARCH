@@ -81,7 +81,7 @@ async function loadHealth() {
         <span class="dot ${s.flow.ok ? "ok" : "bad"}"></span>Flow alerts</span>
       <span data-tip="${s.ibkr.ok ? "Live option prices are streaming from Interactive Brokers." : s.ibkr.idle ? "No live prices while the market is closed." : "No live prices for a while - check that TWS is open and logged in."}">
         <span class="dot ${ib}"></span>IBKR prices</span>
-      ${s.model ? `<span data-tip="The model that decides what to ping. Retrained every night; this version was trained ${esc(s.model.trained)} ET.">Model: ${esc(s.model.kind)}</span>` : ""}
+      ${s.model ? `<span data-tip="The model that decides what to ping. Retrained every night; this version was trained ${esc(s.model.trained)} ET.">Model: ${esc(kindName(s.model.kind))}</span>` : ""}
       <span>${esc(s.now_et)}</span>`;
   } catch (e) {
     $("#health").innerHTML = `<span class="down">Can't read data: ${esc(e.message)}</span>`;
@@ -130,7 +130,7 @@ function cardHTML(c) {
     ${spark(c.spark, c.fill, (c.pnl ?? 0) >= 0)}
     <div class="card-foot">
       <span data-tip="best">Best <b class="${tone(c.best_pnl)}">${pct(c.best_pnl)}</b>${c.best_at ? " at " + when(c.best_at, c.trade_date) : ""}</span>
-      <span data-tip="model">Model expected <b>${pct(c.model)}</b></span>
+      <span data-tip="${c.play ? esc(c.play.about) : "model"}">Model expected <b>${pct(c.model)}</b>${c.play ? ` · 🎯 ${esc(c.play.name)}` : ""}</span>
     </div>
     <div class="chips" data-tip="alerts">${chips}</div>
   </article>`;
@@ -374,6 +374,8 @@ function draw(id, config) {
 }
 const pctAxis = (extra = {}) => ({ ticks: { callback: v => (v > 0 ? "+" : "") + Math.round(v * 100) + "%" }, ...extra });
 function kindName(k) {
+  if (k.startsWith("picker:")) return kindName(k.slice(7)) + " (strategy picker)";
+  if (k.startsWith("profit:")) return kindName(k.slice(7)) + " (profit-trained)";
   const base = { boosting: "Boosted trees", linear: "Linear", forest: "Random forest", knn: "Nearest neighbours",
     similar_trades: "Similar past trades", judges: "Both AI judges alone", hermes: "Hermes alone", qwen: "Qwen alone" };
   const extra = { judges: " + both AI judges", hermes: " + Hermes", qwen: " + Qwen" };
@@ -410,13 +412,20 @@ async function loadLearning() {
     const metric = b => (hasProfit ? b.profit_avg : b.spearman) ?? null;
     const board = [...L.board].filter(b => metric(b) != null).sort((a, b) => metric(b) - metric(a)).slice(0, 12);
     draw("boardChart", { type: "bar", data: {
-      labels: board.map(b => kindName(b.kind.replace("profit:", "")) + (b.kind.startsWith("profit:") ? " (profit-trained)" : "")),
+      labels: board.map(b => kindName(b.kind)),
       datasets: [{ label: "Result per trade (blind)", data: board.map(metric),
         backgroundColor: board.map(b => b.kind === L.winner ? "#3fb950" : metric(b) >= 0 ? "#2f7a43" : "#30598f") }] },
       options: { indexAxis: "y", plugins: { legend: { display: false }, tooltip: { callbacks: {
         label: c => { const b = board[c.dataIndex]; return hasProfit ? `${pct(b.profit_avg)} per trade over ${b.n_pings} trades (takes when its guess ≥ ${pct(b.threshold)})`
           : `rank agreement ${(b.spearman ?? 0).toFixed(2)}`; } } } },
         scales: { x: hasProfit ? pctAxis() : { min: 0 } } } });
+    $("#strategyTable").innerHTML = L.strategies.length ? `<tr><th>Strategy</th><th>How it trades</th><th class="num">Trades</th>
+      <th class="num">Avg per trade</th><th class="num">Won</th><th class="num">0DTE</th><th class="num">1-14 days</th><th class="num">Model's picks</th></tr>` +
+      L.strategies.map(s => `<tr><td><b>${esc(s.name)}</b></td><td class="muted" style="white-space:normal;min-width:260px">${esc(s.about)}</td>
+        <td class="num">${s.n}</td><td class="num ${tone(s.avg)}">${pct(s.avg)}</td><td class="num">${pct(s.win).replace("+", "")}</td>
+        <td class="num ${tone(s.avg_0dte)}">${pct(s.avg_0dte)}</td><td class="num ${tone(s.avg_longer)}">${pct(s.avg_longer)}</td>
+        <td class="num">${s.model_picks || "—"}</td></tr>`).join("")
+      : `<tr><td class="muted">Strategy results appear after the next nightly run.</td></tr>`;
     draw("replayChart", { type: "bar", data: {
       labels: L.replay.map(d => dayShort(d.day)),
       datasets: [
@@ -520,8 +529,9 @@ async function loadContest() {
     const C = contestData = await api("contest", { universe: contestU });
     const r = C.rules;
     $("#contestRules").innerHTML = `<b>Same rules for everyone:</b> start with ${dollars(r.cash)} · put ${Math.round(r.size * 100)}% of the account in each trade
-      (if the cash is free) · buy at the <span class="term" data-tip="ask">ask</span> right after the whale's trade · sell at
-      ${pct(r.target)} or ${pct(r.stop)}, otherwise at the 4 PM <span class="term" data-tip="bid">bid</span> · $${r.fee.toFixed(2)} per contract fees each way.
+      (if the cash is free) · buy at the <span class="term" data-tip="ask">ask</span> right after the whale's trade · each trader
+      gets out with <b>the strategy it chose</b> from the playbook (Hermes and Qwen pick one per trade, the model's strategy picker
+      too; the baseline uses Standard: ${pct(r.target)} / ${pct(r.stop)} / 4 PM) · $${r.fee.toFixed(2)} per contract fees each way.
       <span class="muted">Fractional contracts are allowed, so expensive options still count. Updated every night after the close.</span>`;
     const ranked = [...C.traders].sort((a, b) => b.final - a.final);
     const medal = ["🥇", "🥈", "🥉", ""];
@@ -546,13 +556,16 @@ async function loadContest() {
 }
 function renderContestTrades() {
   const x = contestData.traders.find(t => t.key === contestWho);
-  const why = { target: "Took profit", stop: "Stopped out", close: "Sold at 4 PM" };
-  $("#contestTrades").innerHTML = `<tr><th>When</th><th>Contract</th><th class="num">Paid</th><th class="num">Put in</th>
+  const why = { target: "Took profit", stop: "Stopped out", close: "Sold at 4 PM", trail: "Trailing stop hit",
+    time: "Time exit", next_day: "Sold next morning", expiry: "Held to expiry" };
+  const names = contestData.strategy_names || {};
+  $("#contestTrades").innerHTML = `<tr><th>When</th><th>Contract</th><th>Play</th><th class="num">Paid</th><th class="num">Put in</th>
     <th class="num">Result</th><th class="num">Profit</th><th>How it ended</th></tr>` +
     (x.log.length ? x.log.map(t => `<tr class="click" data-id="${t.id}"><td>${dayShort(t.start)} ${clock(t.start)}</td><td>${esc(t.contract)}</td>
+      <td>${esc(names[t.play] || t.play || "")}</td>
       <td class="num">${money(t.entry)}</td><td class="num">${dollars(t.stake)}</td><td class="num ${tone(t.ret)}">${pct(t.ret)}</td>
       <td class="num ${tone(t.pnl)}">${t.pnl >= 0 ? "+" : ""}${dollars(t.pnl)}</td><td>${why[t.why] || ""}</td></tr>`).join("")
-      : `<tr><td colspan="7" class="muted">No trades yet.</td></tr>`);
+      : `<tr><td colspan="8" class="muted">No trades yet.</td></tr>`);
 }
 $("#contestUniverse").addEventListener("click", e => {
   const b = e.target.closest("button"); if (!b) return;

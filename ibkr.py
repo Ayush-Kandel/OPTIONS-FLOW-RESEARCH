@@ -83,6 +83,23 @@ CREATE TABLE IF NOT EXISTS ib_ping_alerts (     -- live Discord follow-ups alrea
     pick_id INTEGER NOT NULL, level TEXT NOT NULL, sent_utc TEXT NOT NULL,
     PRIMARY KEY (pick_id, level)
 );
+-- companion contracts of big whales on your tickers, so spread strategies can be tested on real quotes:
+-- 'vertical' = next strike further out (same expiry), 'calendar' = same strike, next expiry,
+-- 'straddle' = the other side (put for a call) at the same strike and expiry
+CREATE TABLE IF NOT EXISTS pick_legs (
+    pick_id INTEGER NOT NULL, leg TEXT NOT NULL,
+    ticker TEXT, strike REAL, put_call TEXT, expiration TEXT, con_id INTEGER,
+    status TEXT NOT NULL,                 -- 'ok', 'no_contract', 'no_bars'
+    fetched_utc TEXT NOT NULL,
+    PRIMARY KEY (pick_id, leg)
+);
+CREATE TABLE IF NOT EXISTS ib_leg_bars (
+    pick_id INTEGER NOT NULL, leg TEXT NOT NULL,
+    kind TEXT NOT NULL,                   -- 'BID' or 'ASK'
+    minute_et TEXT NOT NULL,
+    open REAL, high REAL, low REAL, close REAL, volume REAL,
+    PRIMARY KEY (pick_id, leg, kind, minute_et)
+);
 CREATE TABLE IF NOT EXISTS ib_oi (
     ticker TEXT NOT NULL, strike REAL NOT NULL, put_call TEXT NOT NULL, expiration TEXT NOT NULL,
     snap_date     TEXT NOT NULL,        -- ET date of the snapshot (OI = as of the previous close)
@@ -281,6 +298,82 @@ def refresh_greeks(db, log=print):
     n = sum(greeks_path(db, pid) for pid in paths)
     log(f"IBKR Greeks: {len(ids)} picks re-priced with the exact print-minute stock price; "
         f"{n} minute-by-minute Greeks points for {len(paths)} picks")
+
+
+LEG_STRIKE_STEPS = [0.5, 1, 2.5, 5, 10, 25, 50]   # tried in order: the nearest listed strike wins
+LEGS_LOOKBACK_DAYS = 3
+
+
+def _find_leg(ib, tk, k, pc, exp, leg):
+    """The companion contract IBKR actually lists, or None."""
+    tries = []
+    if leg == "vertical":
+        sign = 1 if pc == "CALL" else -1
+        tries = [(k + sign * step, pc, exp) for step in LEG_STRIKE_STEPS]
+    elif leg == "straddle":
+        tries = [(k, "PUT" if pc == "CALL" else "CALL", exp)]
+    elif leg == "calendar":
+        d = date.fromisoformat(exp)
+        tries = [(k, pc, (d + timedelta(days=i)).isoformat()) for i in range(1, 15)
+                 if (d + timedelta(days=i)).weekday() < 5]
+    for strike, right, expiry in tries:
+        c = _option(tk, expiry, strike, right)
+        if ib.call("qualifyContracts", c) and c.conId:
+            return c, strike, right, expiry
+    return None
+
+
+def price_legs(db, deadline=None, log=print):
+    """Real 1-minute BID/ASK bars of each big whale's companion contracts (vertical, calendar,
+    straddle legs) on its print day - recorded now so spread strategies can be backtested on real
+    prices later. Your tickers' pings and $350K+ noteworthy picks from the last few days."""
+    import pipeline
+    ensure_schema(db)
+    if not available():
+        return {}
+    today = datetime.now(ET).date()
+    marks = ",".join("?" * len(pipeline.MY_TICKERS))
+    todo = db.execute(
+        f"SELECT p.id, p.ticker, p.strike, p.put_call, p.expiration, p.trade_date FROM picks p WHERE p.ticker IN ({marks}) "
+        "AND (p.pinged_utc IS NOT NULL OR (p.score IS NOT NULL AND p.premium >= ?)) AND p.trade_date >= ? "
+        "AND p.expiration >= ? AND NOT EXISTS (SELECT 1 FROM pick_legs l WHERE l.pick_id = p.id) "
+        "ORDER BY p.trade_date DESC, p.premium DESC",
+        (*sorted(pipeline.MY_TICKERS), pipeline.NOTEWORTHY_MIN_PREMIUM,
+         (today - timedelta(days=LEGS_LOOKBACK_DAYS)).isoformat(), (today - timedelta(days=1)).isoformat())).fetchall()
+    if not todo:
+        return {}
+    log(f"IBKR: spread legs for {len(todo)} picks (~{len(todo) * 6 * HIST_GAP_SEC / 60:.0f} min)")
+    counts, ib = {}, IbData()
+    try:
+        for pid, tk, k, pc, exp, td in todo:
+            if deadline and time.time() > deadline:
+                log("IBKR: spread legs stopped (deadline)")
+                break
+            if not ib.data_ok():
+                log("IBKR: TWS lost its link - spread legs retry next run")
+                break
+            now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            for leg in ("vertical", "calendar", "straddle"):
+                found = _find_leg(ib, tk, k, pc, exp, leg)
+                status = "no_contract"
+                if found:
+                    c, strike, right, expiry = found
+                    rows = []
+                    for kind in ("BID", "ASK"):
+                        rows += [(pid, leg, kind, *r) for r in _bars(ib, c, date.fromisoformat(td), kind)]
+                    db.executemany("INSERT OR REPLACE INTO ib_leg_bars VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
+                    status = "ok" if rows else "no_bars"
+                    db.execute("INSERT OR REPLACE INTO pick_legs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                               (pid, leg, tk, strike, right, expiry, c.conId, status, now))
+                else:
+                    db.execute("INSERT OR REPLACE INTO pick_legs (pick_id, leg, status, fetched_utc) VALUES (?, ?, ?, ?)",
+                               (pid, leg, status, now))
+                db.commit()
+                counts[status] = counts.get(status, 0) + 1
+    finally:
+        ib.close()
+    log(f"IBKR spread legs: {counts}")
+    return counts
 
 
 def price_spreads(db, deadline=None, log=print):
