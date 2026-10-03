@@ -13,7 +13,8 @@
 <header class="topbar">
   <div class="brand"><span class="logo">◆</span> FlowDesk</div>
   <nav class="tabs" id="tabs">
-    <button data-tab="live" class="active">Live</button>
+    <button data-tab="market" class="active">Market</button>
+    <button data-tab="live">Pings</button>
     <button data-tab="predictions">Predictions</button>
     <button data-tab="contest">Contest</button>
     <button data-tab="learning">Learning</button>
@@ -24,8 +25,58 @@
 </header>
 
 <main>
+  <!-- MARKET: your 12 tickers, live -->
+  <section id="view-market" class="view">
+    <p class="intro">
+      Your tickers right now: price, how today's <span class="term" data-tip="volume">volume</span> compares with a normal
+      day, <span class="term" data-tip="momentum">momentum</span>, whether buyers or sellers are in control, and which way
+      today's <span class="term" data-tip="whale">whales</span> are betting. Click a ticker for its live chart and option contracts.
+    </p>
+    <div class="feed-note" id="feedNote"></div>
+    <div class="toolbar">
+      <div class="legend-row muted small" style="margin:0">
+        <span><span class="sw up-bg"></span>up</span><span><span class="sw down-bg"></span>down</span>
+        <span>Numbers flash when they change</span>
+      </div>
+      <span class="updated" id="mktUpdated"></span>
+    </div>
+    <div class="tiles" id="tiles"></div>
+  </section>
+
+  <!-- TICKER: one stock, live -->
+  <section id="view-ticker" class="view hidden">
+    <button class="back" id="tBack">← Back to the market</button>
+    <div id="tHead"></div>
+    <div class="ticker-grid">
+      <div class="chart-box">
+        <div class="chart-legend" id="tLegend"></div>
+        <div id="tChart"></div>
+        <div class="chart-key">
+          <span><span class="key-line" style="border-color:#3fb950"></span>1-minute candles</span>
+          <span><span class="key-line" style="border-color:#d29922"></span><span class="term" data-tip="vwap">VWAP</span></span>
+          <span><span class="key-line dash" style="border-color:#8b949e"></span>Yesterday's close</span>
+          <span>▲ bullish whale · ▼ bearish whale ($250K+)</span>
+          <span class="muted">Bars at the bottom = volume</span>
+        </div>
+      </div>
+      <div class="panel" id="tBook"></div>
+    </div>
+    <div class="panels" id="tPanels"></div>
+    <div class="panel table-wrap" style="margin-top:14px">
+      <h3>Option contracts we're tracking on <span id="tName"></span></h3>
+      <p class="muted small">Every contract a whale traded that hasn't expired. <span class="term" data-tip="oi">Open interest</span>
+        only updates once a day (overnight); the live signal is <span class="term" data-tip="voloi">volume ÷ open interest</span>.
+        Click a row for its full chart.</p>
+      <table class="table" id="tContracts"></table>
+    </div>
+    <div class="panel table-wrap" style="margin-top:14px">
+      <h3 id="tWhalesTitle">Whale trades on this ticker today</h3>
+      <table class="table" id="tWhales"></table>
+    </div>
+  </section>
+
   <!-- LIVE: list of pinged contracts -->
-  <section id="view-live" class="view">
+  <section id="view-live" class="view hidden">
     <p class="intro">
       These are the big option trades (<b>whales</b>) our system pinged you about.
       <b>P&amp;L</b> shows what you would have now if you had bought at the whale's price and sold at the
