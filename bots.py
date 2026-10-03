@@ -323,7 +323,7 @@ def scout_hour(db, hours=1):
     gaps = db.execute("SELECT GROUP_CONCAT(ticker) FROM polls WHERE started_utc >= ? AND flag = 'possible_gap'",
                       (since,)).fetchone()[0]
     pings = db.execute("SELECT COUNT(*) FROM picks WHERE pinged_utc >= ?", (since,)).fetchone()[0]
-    used = f"{credits}/100 credits" if hours == 1 else f"{credits} credits"
+    used = f"{credits}/150 credits" if hours == 1 else f"{credits} credits"
     label = "last hour" if hours == 1 else f"last {hours} hours"
     return (f"🛰️ **Scout - {label}:** {used}, calls {calls}, {prints} new flow prints, "
             f"{mine or 0} new picks on your tickers ({total} total), {pings} ping(s), {errors} errors"

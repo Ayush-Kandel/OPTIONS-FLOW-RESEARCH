@@ -224,6 +224,13 @@ function storyHTML(d) {
   const s = [`On <b>${day(d.trade_date)} at ${clock(start)}</b>, a whale bought <b>${Number(d.size).toLocaleString()}</b> contracts of
     <b>${esc(name(d))}</b> at <b>${money(d.fill)}</b> each (${bigMoney(d.premium)} in total).`];
   if (d.flags.length) s.push(`The trade was ${d.flags.map(f => FLAG_WORDS[f] || esc(f.replace(/_/g, " "))).join(" and ")}.`);
+  if (d.whale_watch) {
+    const w = d.whale_watch, secs = Math.round((Date.parse(w.seen.replace(" ", "T") + "Z") -
+      Date.parse(d.trade_date + "T" + w.trade_time + "Z")) / 1000);
+    s.push(`Our <span class="term" data-tip="latency">whale watch</span> spotted it at <b>${clock(w.seen)}</b>` +
+      ` (${secs < 120 ? secs + " seconds" : Math.round(secs / 60) + " min"} after the trade)` +
+      (d.listed_at ? `; Trade Echo's scored list had it at ${clock(d.listed_at)}.` : "."));
+  }
   if (d.pinged_at) {
     const lag = minutesBetween(start, d.pinged_at);
     s.push(`Our ping went out at <b>${clock(d.pinged_at)}</b>, <span data-tip="latency" class="term">${lag} min after the whale</span>` +

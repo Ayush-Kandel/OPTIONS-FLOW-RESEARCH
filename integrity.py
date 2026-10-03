@@ -90,10 +90,13 @@ def run_checks(db, now_et, in_session, after_close_expected):
 
     # 3. Credits, refusals, errors in the last 24 h
     since = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat(timespec="seconds")
-    over = _q(db, "SELECT substr(started_utc, 1, 13), SUM(credits_charged) FROM polls WHERE started_utc >= ? "
-                  "GROUP BY 1 HAVING SUM(credits_charged) > 100", (since,))
+    # Trade Echo caps 100/hr per connection and 150/hr per user; the whale watch is connection 2
+    over = _q(db, "SELECT substr(started_utc, 1, 13), SUM(CASE WHEN COALESCE(conn, 1) = 1 THEN credits_charged "
+                  "ELSE 0 END) AS main, SUM(credits_charged) AS total FROM polls WHERE started_utc >= ? "
+                  "GROUP BY 1 HAVING main > 100 OR total > 150", (since,))
     add("credits", FAIL if over else OK,
-        f"hours over the 100-credit cap: {over}" if over else "every hour stayed within 100 credits")
+        f"hours over the credit caps (hour, main connection, total): {over}" if over
+        else "every hour stayed within 100 credits per connection and 150 in total")
     refusals = _one(db, "SELECT COUNT(*) FROM rate_limit_events WHERE at_utc >= ?", (since,))
     add("rate_limits", WARN if refusals else OK,
         f"Trade Echo refused {refusals} call(s) in 24 h" if refusals else "no refused calls in 24 h")

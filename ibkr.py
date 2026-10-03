@@ -372,6 +372,7 @@ def price_holding_days(db, deadline=None, log=print):
 
 LIVE_STREAM_MAX = 70     # contracts streamed live at once; + OI batch (20) + entry quote stays under
                          # IBKR's 100 market-data lines
+WHALE_STREAM_MAX = 20    # of those, at most this many whale-watch sightings (newest first)
 
 
 class LiveQuotes:
@@ -384,15 +385,23 @@ class LiveQuotes:
         self.streams, self.last_minute = {}, None
 
     def refresh(self):
-        from ib_async import Option
         today = datetime.now(ET).date().isoformat()
         marks = ",".join("?" * len(self.my))
-        wanted = [tuple(r[:4]) for r in self.db.execute(
+        picks = self.db.execute(
             f"SELECT ticker, strike, put_call, expiration, MAX(pinged_utc IS NOT NULL) AS pinged, "
             f"MAX(ticker IN ({marks})) AS mine, MAX(trade_date || trade_time_et) AS latest FROM picks "
             f"WHERE expiration >= ? GROUP BY ticker, strike, put_call, expiration "
             f"ORDER BY pinged DESC, mine DESC, latest DESC LIMIT ?",
-            (*sorted(self.my), today, LIVE_STREAM_MAX))]
+            (*sorted(self.my), today, LIVE_STREAM_MAX)).fetchall()
+        # whales the whale watch spotted today on your tickers: priced from first sight,
+        # before Trade Echo's scored list (and our ping) catch up
+        whales = [tuple(r) for r in self.db.execute(
+            f"SELECT p.ticker, p.strike, p.put_call, p.expiration FROM prints p JOIN polls q ON q.id = p.poll_id "
+            f"WHERE q.kind = 'whale' AND p.trade_date = ? AND p.ticker IN ({marks}) AND p.expiration >= ? "
+            f"GROUP BY 1, 2, 3, 4 ORDER BY MAX(p.trade_time_et) DESC LIMIT ?",
+            (today, *sorted(self.my), today, WHALE_STREAM_MAX))]
+        ordered = [tuple(r[:4]) for r in picks if r[4]] + whales + [tuple(r[:4]) for r in picks if not r[4]]
+        wanted = list(dict.fromkeys(ordered))[:LIVE_STREAM_MAX]
         for key in [k for k in self.streams if k not in wanted]:
             self.ib.call("cancelMktData", self.streams.pop(key)[0])
         new = [k for k in wanted if k not in self.streams]
@@ -778,7 +787,7 @@ def run_live(db, in_session, next_open, my_tickers, log=print):
     ib, contracts = None, {}
     busy = {"entries": False}
     oi_day = {"date": None}
-    live = {"quotes": None}
+    live = {"quotes": None, "whale_poll": None}
     alerts = {"summary": None}
 
     def entries_hook():
@@ -789,7 +798,10 @@ def run_live(db, in_session, next_open, my_tickers, log=print):
         try:
             new_pings = record_entries(db, ib, contracts, log)
             if live["quotes"]:
-                if new_pings:             # stream a newly pinged contract right away
+                # the whale watch found new prints -> stream any new whale on your tickers right away
+                whale_poll = db.execute("SELECT MAX(id) FROM polls WHERE kind = 'whale' AND new_rows > 0").fetchone()[0]
+                if new_pings or whale_poll != live["whale_poll"]:
+                    live["whale_poll"] = whale_poll
                     live["quotes"].refresh()
                 if live["quotes"].record():   # a new minute was saved -> check follow-ups
                     ping_updates(db, alerts, log)

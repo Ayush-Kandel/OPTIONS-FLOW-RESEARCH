@@ -139,6 +139,16 @@ def detail(pick_id):
                            "WHERE pick_id = ? AND status = 'ok'", (pick_id,)).fetchone()
         stats = db.execute("SELECT spread_at_print, spread_pct_at_print, median_spread_pct FROM ib_stats "
                            "WHERE pick_id = ?", (pick_id,)).fetchone()
+        # latency: the first whale-watch sighting of a whale-size print on this contract near the
+        # trade time (the scored noteworthy row can be timed a minute or two differently)
+        h, m = (int(x) for x in p["trade_time_et"][:5].split(":"))
+        lo, hi = f"{max(h * 60 + m - 3, 0) // 60:02d}:{max(h * 60 + m - 3, 0) % 60:02d}:00", \
+                 f"{(h * 60 + m + 3) // 60:02d}:{(h * 60 + m + 3) % 60:02d}:59"
+        whale = db.execute(
+            "SELECT p.first_seen_utc, p.trade_time_et, p.updated_utc FROM prints p JOIN polls q ON q.id = p.poll_id "
+            "WHERE q.kind = 'whale' AND p.ticker = ? AND p.strike = ? AND p.put_call = ? AND p.expiration = ? "
+            "AND p.trade_date = ? AND p.trade_time_et BETWEEN ? AND ? ORDER BY p.first_seen_utc LIMIT 1",
+            (p["ticker"], p["strike"], p["put_call"], p["expiration"], p["trade_date"], lo, hi)).fetchone()
     flags = json.loads(p["flags"]) if p["flags"] else []
     alerts = []
     with closing(_db()) as db:
@@ -153,6 +163,9 @@ def detail(pick_id):
                    "theta_contract": p["theta"] * 100 if p["theta"] is not None else None,
                    "spot": p["spot_at_print"]},
         "pinged_at": _minute_of(p["pinged_utc"]),
+        "listed_at": _minute_of(p["first_seen_utc"]) if p["first_seen_utc"] else None,
+        "whale_watch": {"seen": datetime.fromisoformat(whale[0]).astimezone(ET).strftime("%Y-%m-%d %H:%M:%S"),
+                        "trade_time": whale[1]} if whale else None,
         "ping_entry": dict(entry) if entry else None,
         "spread": dict(stats) if stats else None,
         "final": {"best": p["true_gain_pct"], "close": p["true_close_pct"], "source": p["true_source"],

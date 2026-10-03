@@ -142,7 +142,7 @@ async function refresh(){
  document.getElementById('now').textContent=s.now_et;
  const age=s.logger.age_sec, alive=age!=null&&age<900;
  document.getElementById('scout').innerHTML=`<div><div class="stat">${alive?'🟢':'⚪'} ${age==null?'–':Math.round(age/60)+' min'}</div><div class="muted">since last Trade Echo call</div></div>
-  <div><div class="stat">${s.credits.length?s.credits[s.credits.length-1].credits:0}/100</div><div class="muted">credits this hour (UTC ${s.credits.length?s.credits[s.credits.length-1].hour_utc:''})</div></div>
+  <div><div class="stat">${s.credits.length?s.credits[s.credits.length-1].credits:0}/150</div><div class="muted">credits this hour (UTC ${s.credits.length?s.credits[s.credits.length-1].hour_utc:''})</div></div>
   <div><div class="stat">${s.picks_today.length} / ${s.picks_today.length+s.others_today}</div><div class="muted">picks today: yours / all</div></div>`;
  chart('creditChart',{type:'bar',data:{labels:s.credits.map(c=>c.hour_utc+'h'),datasets:[{label:'credits / hour (UTC)',data:s.credits.map(c=>c.credits),backgroundColor:'#58a6ff'}]},options:{scales:{y:{max:100,beginAtZero:true}},plugins:{legend:{display:false}}}});
  const sev={OK:'ok',WARN:'warn',FAIL:'fail'};

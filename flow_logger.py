@@ -66,7 +66,17 @@ DEALER_STAGGER_SEC = 600       # one Dealer Edge call every 10 minutes
 HOURLY_STOP = 100              # the per-connection cap; use all of it
 DEALER_HOURLY_STOP = 92        # Dealer Edge stops earlier, leaving room for flow
 BURST_WINDOW_SEC = 300
-BURST_STOP = 13                # max credits in any 5 minutes (server burst cap: 15)
+BURST_STOP = 14                # max credits in any 5 minutes, both connections together (server: 15)
+
+# Whale watch on a SECOND connection, which gets the other 50 of the 150/hr user cap. Trade Echo
+# receives raw prints within ~3 s, but its scored noteworthy list can lag 5-10 min at the open
+# (Oct 2: TSLA 365C listed 13 min after the trade), so the raw tape is polled market-wide for
+# whale-size prints. Silent for now: prints are stored and streamed on IBKR from first sight;
+# pings still wait for the noteworthy score + the model.
+WHALE_INTERVAL_SEC = 72        # 1 cr every 72 s       -> 50 credits/hr
+WHALE_HOURLY_STOP = 50
+WHALE_WINDOW_MIN = 3           # each poll asks for prints since 3 minutes ago
+USER_HOURLY_STOP = 150
 
 SESSION_OPEN = dtime(9, 30)
 SESSION_CLOSE = dtime(16, 15)
@@ -211,6 +221,8 @@ def open_db(path=DB_PATH):
     db.execute("PRAGMA journal_mode=WAL")  # lets you query while the logger runs
     db.execute("PRAGMA busy_timeout = 30000")
     db.executescript(SCHEMA)
+    if "conn" not in {r[1] for r in db.execute("PRAGMA table_info(polls)")}:
+        db.execute("ALTER TABLE polls ADD COLUMN conn INTEGER")   # 2 = second Trade Echo connection
     pipeline.ensure_schema(db)
     import bots
     import integrity
@@ -273,20 +285,26 @@ def utc_iso(epoch=None):
 class CreditBudget:
     """Tracks credits per UTC clock hour and in a rolling burst window."""
 
-    def __init__(self):
+    def __init__(self, recent=None):
         self.hour_key = None
         self.hour_used = 0
-        self.recent = deque()  # (epoch, credits)
+        # (epoch, credits); the whale-watch budget shares this deque so the burst cap covers both
+        self.recent = recent if recent is not None else deque()
 
     @classmethod
-    def from_db(cls, db):
-        budget = cls()
+    def from_db(cls, db, whale=False, recent=None):
+        """This connection's credits in the last hour: the main one, or the second one (whale=True)."""
+        budget = cls(recent)
         since = time.time() - 3600
         for epoch, credits in db.execute(
-                "SELECT started_epoch, credits_charged FROM polls "
-                "WHERE started_epoch >= ? AND credits_charged > 0 ORDER BY started_epoch",
-                (since,)):
+                "SELECT started_epoch, credits_charged FROM polls WHERE started_epoch >= ? AND "
+                "credits_charged > 0 AND COALESCE(conn, 1) = ? ORDER BY started_epoch",
+                (since, 2 if whale else 1)):
             budget.charge(credits, epoch)
+        if recent is not None:   # keep the shared burst window in time order
+            items = sorted(recent)
+            recent.clear()
+            recent.extend(items)
         return budget
 
     def _roll(self, now):
@@ -408,11 +426,11 @@ class TradeEcho:
 
 # ------------------------------------------------------------------- polls --
 
-def _insert_poll(db, kind, ticker, started, credits, rows_returned=None, error=None):
+def _insert_poll(db, kind, ticker, started, credits, rows_returned=None, error=None, conn=None):
     cur = db.execute(
         "INSERT INTO polls (kind, ticker, started_utc, started_epoch, rows_returned, "
-        "credits_charged, error) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (kind, ticker, utc_iso(started), started, rows_returned, credits, error))
+        "credits_charged, error, conn) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (kind, ticker, utc_iso(started), started, rows_returned, credits, error, conn))
     return cur.lastrowid
 
 
@@ -435,22 +453,10 @@ def record_rate_limit(db, tool, ticker, data):
     db.commit()
 
 
-def poll_flow(te, db, budget, ticker, first_today):
-    started = time.time()
-    payload = te.call("get_option_flow", {
-        "ticker": ticker,
-        "max_dte_days": MAX_DTE_DAYS,
-        "min_premium": TICKER_MIN_PREMIUM.get(ticker, MIN_PREMIUM),
-        "limit": FLOW_LIMIT,
-    })
-    rows = pipeline._rows(payload, "rows")
-    meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
-    credits = int(meta.get("creditsCharged", 1))
-    budget.charge(credits, started)
-
-    poll_id = _insert_poll(db, "flow", ticker, started, credits, rows_returned=len(rows))
+def _store_prints(db, rows, poll_id, ticker=None):
+    """Save raw flow prints; returns the rows that were new."""
     seen = utc_iso()
-    new = 0
+    new = []
     for r in rows:
         premium = r.get("premium")
         cur = db.execute(
@@ -465,7 +471,49 @@ def poll_flow(te, db, budget, ticker, first_today):
              round(premium, 2) if isinstance(premium, (int, float)) else None,
              r.get("spot"), r.get("dteDays"), r.get("sentiment"),
              r.get("option_activity_type"), r.get("updated"), seen, poll_id))
-        new += cur.rowcount
+        if cur.rowcount:
+            new.append(r)
+    return new
+
+
+def poll_whales(te, db, budget, et):
+    """Whale watch: whale-size raw prints across the whole tape since a few minutes ago."""
+    started = time.time()
+    t_from = max(et - timedelta(minutes=WHALE_WINDOW_MIN), et.replace(hour=9, minute=30, second=0, microsecond=0))
+    payload = te.call("get_option_flow", {
+        "min_premium": pipeline.NOTEWORTHY_MIN_PREMIUM,
+        "max_dte_days": MAX_DTE_DAYS,
+        "time_from": t_from.strftime("%H:%M"),
+        "limit": FLOW_LIMIT,
+    })
+    rows = pipeline._rows(payload, "rows")
+    meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+    credits = int(meta.get("creditsCharged", 1))
+    budget.charge(credits, started)
+    poll_id = _insert_poll(db, "whale", "*", started, credits, rows_returned=len(rows), conn=2)
+    new = _store_prints(db, rows, poll_id)
+    flag = "possible_gap" if len(rows) >= FLOW_LIMIT and len(new) >= FLOW_LIMIT else None
+    db.execute("UPDATE polls SET new_rows = ?, flag = ? WHERE id = ?", (len(new), flag, poll_id))
+    db.commit()
+    mine = [r for r in new if r.get("ticker") in pipeline.MY_TICKERS]
+    return rows, new, mine, flag, t_from.strftime("%H:%M")
+
+
+def poll_flow(te, db, budget, ticker, first_today):
+    started = time.time()
+    payload = te.call("get_option_flow", {
+        "ticker": ticker,
+        "max_dte_days": MAX_DTE_DAYS,
+        "min_premium": TICKER_MIN_PREMIUM.get(ticker, MIN_PREMIUM),
+        "limit": FLOW_LIMIT,
+    })
+    rows = pipeline._rows(payload, "rows")
+    meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+    credits = int(meta.get("creditsCharged", 1))
+    budget.charge(credits, started)
+
+    poll_id = _insert_poll(db, "flow", ticker, started, credits, rows_returned=len(rows))
+    new = len(_store_prints(db, rows, poll_id, ticker))
 
     flag = None
     if len(rows) >= FLOW_LIMIT and new >= FLOW_LIMIT:
@@ -559,36 +607,53 @@ def poll_noteworthy(te, db, budget, et):
     return total, mine, new_ids, outside, (t_from, t_to)
 
 
-def make_budgeted_call(te, db, budget):
-    """call(tool, args, kind, ticker) that waits for credit room and obeys 429s."""
+def make_budgeted_call(te, db, budget, alt=None):
+    """call(tool, args, kind, ticker) that waits for credit room and obeys 429s. With `alt` =
+    (client, budget) of the second connection, calls spill onto it once the main connection's
+    100 are spent, so nightly work and the harvest can use the whole 150/hr user cap."""
+    def pick(cost):
+        now = time.time()
+        if budget.allows(cost, HOURLY_STOP, now):
+            return te, budget, None
+        if alt and alt[1].allows(cost, WHALE_HOURLY_STOP, now):
+            return alt[0], alt[1], 2
+        return None
+
     def call(tool, arguments, kind, ticker):
         cost = TOOL_COST.get(tool, 2)
         for attempt in range(4):
             noted = False
-            while not budget.allows(cost, HOURLY_STOP, time.time()):
+            while (chosen := pick(cost)) is None:
                 if not noted:
                     print(f"{_stamp()} Credit guard: waiting ({_budget_text(budget)}).")
                     noted = True
                 time.sleep(5)
+            client, bud, conn = chosen
             started = time.time()
             try:
-                payload = te.call(tool, arguments)
+                payload = client.call(tool, arguments)
             except RateLimited as e:
                 record_rate_limit(db, tool, ticker, e.data)
+                used, limit = e.data.get("creditsUsedConn"), e.data.get("creditsLimitConn")
+                if isinstance(used, int) and isinstance(limit, int) and used >= limit - cost:
+                    # this connection's hour is spent: mark it full and let pick() use the other
+                    bud.sync_hour(HOURLY_STOP if conn is None else WHALE_HOURLY_STOP, time.time())
+                    print(f"{_stamp()} RATE LIMITED ({tool}, connection {conn or 1} full for this hour).")
+                    continue
                 print(f"{_stamp()} RATE LIMITED ({tool}). Waiting {e.retry_after}s.")
                 time.sleep(e.retry_after + 2)
                 continue
             except (HttpError, RpcError, urllib.error.URLError, OSError, ValueError) as e:
                 record_failed_poll(db, kind, ticker, started, e)
-                te.reset()
+                client.reset()
                 if attempt == 3:
                     raise
                 print(f"{_stamp()} ERROR ({tool} {ticker}): {str(e)[:200]} - retrying in 30s")
                 time.sleep(30)
                 continue
             credits = int((payload.get("meta") or {}).get("creditsCharged", cost))
-            budget.charge(credits, started)
-            _insert_poll(db, kind, ticker, started, credits)
+            bud.charge(credits, started)
+            _insert_poll(db, kind, ticker, started, credits, conn=conn)
             db.commit()
             return payload
         raise RuntimeError(f"{tool} kept failing")
@@ -617,10 +682,12 @@ class DayState:
     first_poll_done: set = field(default_factory=set)
     next_backtest: float = 0.0     # Simulator/Analyst/Judges re-run every 30 min in session
     scout_hour: int = -1           # last ET hour Scout reported
+    whale_on: bool = True          # off for the day if the 2nd connection turns out to share the 100 cap
 
 
 def build_jobs(start):
-    jobs = [Job("noteworthy", "*", NOTEWORTHY_INTERVAL_SEC, 0, 2, start + 15)]
+    jobs = [Job("noteworthy", "*", NOTEWORTHY_INTERVAL_SEC, 0, 2, start + 15),
+            Job("whale", "*", WHALE_INTERVAL_SEC, 0, 1, start + 50)]
     for i, t in enumerate(FAST_TICKERS):
         jobs.append(Job("flow", t, FAST_INTERVAL_SEC, 0, 1, start + i * FAST_STAGGER_SEC))
     for i, t in enumerate(SLOW_TICKERS):
@@ -640,9 +707,13 @@ def _stamp():
     return now_et().strftime("%H:%M:%S")
 
 
+_whale_budget = None   # set by run_logger when the whale watch connection exists
+
+
 def _budget_text(budget):
     now = time.time()
-    return (f"credits hr={budget.hour_used}/{HOURLY_STOP} "
+    whale = (f" whale={_whale_budget.hour_used}/{WHALE_HOURLY_STOP}" if _whale_budget else "")
+    return (f"credits hr={budget.hour_used}/{HOURLY_STOP}{whale} "
             f"5m={budget.burst_used(now)}/{BURST_STOP}")
 
 
@@ -676,13 +747,22 @@ def update_market_state(state, rows, et):
                   "treating as an early close.")
 
 
-def run_job(job, state, te, db, budget):
-    """Run one job. Returns an epoch to pause all polling until, or 0."""
+def run_job(job, state, te, db, budget, whale=None):
+    """Run one job. Returns an epoch to pause all polling until, or 0.
+    `whale` = (client, budget) of the second connection used by the whale watch."""
     now = time.time()
     tool = {"flow": "get_option_flow", "dealer_edge": "get_dealer_edge_data",
-            "noteworthy": "get_noteworthy_flow"}[job.kind]
+            "noteworthy": "get_noteworthy_flow", "whale": "get_option_flow"}[job.kind]
     try:
-        if job.kind == "noteworthy":
+        if job.kind == "whale":
+            rows, new, mine, flag, t_from = poll_whales(whale[0], db, whale[1], now_et())
+            print(f"{_stamp()} WHALES {t_from}-now rows={len(rows)} new={len(new)} yours={len(mine)}  "
+                  f"{_budget_text(budget)}" + ("  << POSSIBLE GAP" if flag else ""))
+            for r in mine:
+                print(f"{_stamp()}   whale spotted: {r.get('ticker')} {r.get('strike_price')} {r.get('put_call')} "
+                      f"{(r.get('date_expiration') or '')[:10]} at {r.get('trade_time_et')} "
+                      f"${(r.get('premium') or 0) / 1e3:,.0f}K {r.get('option_activity_type') or ''}")
+        elif job.kind == "noteworthy":
             total, mine, new_ids, outside, (t_from, t_to) = poll_noteworthy(te, db, budget, now_et())
             print(f"{_stamp()} NOTEWORTHY {t_from}-{t_to} picks={total} yours={mine} "
                   f"new={len(new_ids)}  {_budget_text(budget)}")
@@ -720,6 +800,22 @@ def run_job(job, state, te, db, budget):
     except RateLimited as e:
         record_rate_limit(db, tool, job.ticker, e.data)
         used = e.data.get("creditsUsedConn")
+        if job.kind == "whale":   # only the whale watch waits; the main connection carries on
+            if isinstance(used, int):
+                whale[1].sync_hour(used, time.time())
+            print(f"{_stamp()} RATE LIMITED (whale watch): used conn/user = {used}/"
+                  f"{e.data.get('creditsUsedUser')}; whale watch waits {e.retry_after}s")
+            job.next_due = now + e.retry_after + 2
+            return 0
+        if isinstance(used, int) and used > budget.hour_used + 5 and state.whale_on:
+            # the server counts more on this connection than it made: the whale watch's credits
+            # land on the same counter, so it would starve the noteworthy polls - turn it off
+            state.whale_on = False
+            print(f"{_stamp()} Whale watch OFF for today: the server counts {used} credits on the main "
+                  f"connection but it made {budget.hour_used} - both connections share one counter.")
+            pipeline.discord_send("⚠️ **Whale watch turned off for today**: Trade Echo counts the second "
+                                  "connection against the main one's 100 credits/hour, so it would slow the "
+                                  "noteworthy polls. Pings are unaffected.", bot="auditor")
         if isinstance(used, int):
             budget.sync_hour(used, time.time())
         print(f"{_stamp()} RATE LIMITED on {job.ticker} ({e}). Server says wait "
@@ -736,11 +832,11 @@ def run_job(job, state, te, db, budget):
         return 0
     except (HttpError, RpcError, urllib.error.URLError, OSError, ValueError) as e:
         record_failed_poll(db, job.kind, job.ticker, now, e)
-        te.reset()
-        print(f"{_stamp()} ERROR  {job.ticker} {type(e).__name__}: {str(e)[:300]} "
+        (whale[0] if job.kind == "whale" else te).reset()
+        print(f"{_stamp()} ERROR  {job.kind} {job.ticker} {type(e).__name__}: {str(e)[:300]} "
               "- will reconnect and retry in 60s")
         job.next_due = now + 60
-        return now + 15
+        return 0 if job.kind == "whale" else now + 15
 
 
 def sleep_until(target):
@@ -796,9 +892,12 @@ def run_logger():
     acquire_single_instance_lock()
     token = load_token()
     db = open_db()
+    global _whale_budget
     budget = CreditBudget.from_db(db)
+    _whale_budget = CreditBudget.from_db(db, whale=True, recent=budget.recent)
     te = TradeEcho(token)
     te._connect()  # fail fast if the server or tools are wrong
+    te_whale = TradeEcho(token)   # second connection (its own session) for the whale watch
     print(f"Logger started. Tools verified read-only: {', '.join(sorted(ALLOWED_TOOLS))}.")
     print(f"Saving to {DB_PATH.name}. {_budget_text(budget)}. Press Ctrl+C to stop.")
     keep_awake(True)          # 24/7 while the logger runs; Windows lifts it when we exit
@@ -821,7 +920,7 @@ def run_logger():
             day = state.day.isoformat()
             if not pipeline.after_close_done(db, day):
                 try:
-                    pipeline.run_after_close(db, make_budgeted_call(te, db, budget), day)
+                    pipeline.run_after_close(db, make_budgeted_call(te, db, budget, (te_whale, _whale_budget)), day)
                 except Exception as e:  # never let the nightly step kill the logger
                     print(f"{_stamp()} After-close run failed: {type(e).__name__}: {e}. "
                           f"Retry with: py flow_logger.py --after-close {day}")
@@ -839,7 +938,7 @@ def run_logger():
                     pipeline.discord_send(bots.scout_hour(db, hours=8), bot="scout")
                 except Exception as e:
                     print(f"{_stamp()} Scout summary failed: {type(e).__name__}: {e}")
-                run_overnight_harvest(db, te, budget, state.day)
+                run_overnight_harvest(db, te, budget, state.day, alt=(te_whale, _whale_budget))
                 run_ibkr(db)  # price the picks the harvest just added
                 try:
                     import bots
@@ -867,7 +966,8 @@ def run_logger():
             run_periodic_bots(db, state, et, now)
 
         eligible = [j for j in state.jobs
-                    if state.confirmed_open or (j.kind == "flow" and j.ticker == "SPY")]
+                    if (state.confirmed_open and (j.kind != "whale" or state.whale_on))
+                    or (j.kind == "flow" and j.ticker == "SPY")]
         due = sorted((j for j in eligible if j.next_due <= now),
                      key=lambda j: (j.priority, j.next_due))
         if not due:
@@ -876,15 +976,21 @@ def run_logger():
             continue
 
         job = due[0]
-        cap = HOURLY_STOP if job.priority < 2 else DEALER_HOURLY_STOP
-        if not budget.allows(job.cost, cap, now):
+        if job.kind == "whale":
+            bud, cap = _whale_budget, WHALE_HOURLY_STOP
+            if not bud.allows(job.cost, cap, now) and bud.hour_used + job.cost > cap:
+                job.next_due = (now // 3600 + 1) * 3600 + 5   # its 50 are spent: wait for the new hour
+                continue
+        else:
+            bud, cap = budget, (HOURLY_STOP if job.priority < 2 else DEALER_HOURLY_STOP)
+        if not bud.allows(job.cost, cap, now):
             if not waiting_note:
                 print(f"{_stamp()} Credit guard: holding calls ({_budget_text(budget)}).")
                 waiting_note = True
             time.sleep(5)
             continue
         waiting_note = False
-        pause_until = run_job(job, state, te, db, budget)
+        pause_until = run_job(job, state, te, db, budget, whale=(te_whale, _whale_budget))
 
 
 def harvest_sessions(last_day):
@@ -916,15 +1022,16 @@ def run_ibkr(db):
                               bot="auditor")
 
 
-def run_overnight_harvest(db, te, budget, last_day):
-    """Spend idle overnight credits on extra REAL training data. Stops at 9:00 ET so the credit
-    hour containing the 9:30 open (credits reset on the UTC hour = 9:00 ET) is left untouched."""
+def run_overnight_harvest(db, te, budget, last_day, alt=None):
+    """Spend idle overnight credits on extra REAL training data (both connections when `alt` is
+    given: up to 150/hr). Stops at 9:00 ET so the credit hour containing the 9:30 open (credits
+    reset on the UTC hour = 9:00 ET) is left untouched."""
     deadline = next_open_et(now_et(), skip_today=now_et().time() >= SESSION_OPEN).timestamp() - 30 * 60
     try:
         pipeline.discord_send("🌙 **Scout:** overnight harvest starting - pulling $100K+ noteworthy picks and "
                               "Algo Edge alerts (training only) with idle credits; stops at 9:00 AM ET so "
-                              "the opening hour keeps its full 100 credits.", bot="scout")
-        pipeline.run_harvest(db, make_budgeted_call(te, db, budget), harvest_sessions(last_day), deadline)
+                              "the opening hour keeps its full credits.", bot="scout")
+        pipeline.run_harvest(db, make_budgeted_call(te, db, budget, alt), harvest_sessions(last_day), deadline)
         total = db.execute("SELECT COUNT(*), SUM(day_stats_status = 'ok') FROM picks").fetchone()
         pipeline.discord_send(f"🌙 **Scout:** harvest done - training data now {total[1] or 0} priced picks "
                               f"({total[0]} stored).", bot="scout")
