@@ -28,6 +28,8 @@ const GLOSSARY = {
   alerts: ["Alerts", "Discord alerts that fired the first time the bid crossed +30%, +50%, +100% or -50% from the whale's price."],
   latency: ["Ping delay", "How long after the whale's trade our ping went out. By then the price may already have moved."],
   tradeResult: ["As a trade", "What following this whale really earned: buy at the ask right after its trade, sell when the bid hits +30% or −50%, otherwise at 4 PM, after $0.65/contract fees each way. This is what the model is now trained and judged on."],
+  blindtest: ["Blind test", "To trade a day, the Lab searches for the best strategy using ONLY the days before it, then trades that strategy on the day it never saw. Repeated for every day. It measures whether the search itself finds strategies that keep working - not whether one strategy looked good after the fact."],
+  lucktest: ["Luck test", "The whole blind test is rerun many times on data where each day's results were shuffled between trades, so no real pattern is left. If the shuffled runs often do as well as the real one, the real result is just luck. p = the share of shuffled runs that did at least as well (below 0.05 = convincing)."],
   walkforward: ["Walk-forward test", "The honest way to backtest: to judge Wednesday, the model is trained only on Monday and Tuesday, then predicts Wednesday's picks blind. No peeking at the future."],
   rank: ["Rank agreement", "Does the model put the picks in the right order, from worst to best? 0 means random guessing, 1 means a perfect order. Anything steadily above 0.2 is useful for trading."],
   side: ["Bought or sold?", "Whether the whale was BUYING (paid the ask) or SELLING (hit the bid). Following only makes sense when the whale bought. From Trade Echo's trade sentiment, cross-checked with IBKR's own bid/ask at that minute."],
@@ -583,6 +585,59 @@ $("#contestTrades").addEventListener("click", e => {
   const row = e.target.closest("tr[data-id]"); if (row) openDetail(row.dataset.id);
 });
 
+// ---------- lab ----------
+const LAB_STATUS = {
+  "searching": ["🔎", "Searching", "Not enough days yet for a blind test."],
+  "not profitable yet": ["⏳", "Not profitable yet", "The search's blind trades don't make money reliably yet, or don't beat the luck test. It keeps testing every day as new data arrives."],
+  "promising": ["🌱", "Promising", "The blind trades make money and beat most shuffled runs - but not convincingly yet. Paper only; more days needed."],
+  "validated": ["✅", "Validated", "The blind trades made money over 30+ trades and beat 95% of shuffled runs. Next: a live paper test before any real money."],
+};
+async function loadLab() {
+  try {
+    const L = await api("lab");
+    if (!L.run) { $("#labStatus").innerHTML = "The Lab hasn't finished its first run yet - it starts automatically and runs in the background."; return; }
+    const r = L.run, st = LAB_STATUS[r.status] || LAB_STATUS["searching"];
+    $("#labStatus").innerHTML = `<b style="font-size:18px">${st[0]} ${st[1]}</b><br>${st[2]}
+      <span class="muted">Last full search: ${esc(runTime(r.finished_utc))} ET on ${r.n_picks} trades over ${r.n_days} days.</span>`;
+    $("#labStats").innerHTML = `
+      <div class="stat"><div class="label">Strategies per search</div><div class="value">${(r.n_strategies / 1e6).toFixed(0)}M</div><div class="sub">${r.n_conditions} conditions × ${r.n_columns} entry/exit combos</div></div>
+      <div class="stat"><div class="label" data-tip="blindtest">Blind trades</div><div class="value ${tone(r.blind_avg)}">${pct(r.blind_avg)}</div><div class="sub">per trade · ${r.blind_n} trades over ${r.blind_days} days · won ${pct(r.blind_win).replace("+", "")}</div></div>
+      <div class="stat"><div class="label" data-tip="lucktest">Luck test</div><div class="value">${L.p == null ? "—" : "p = " + L.p.toFixed(2)}</div><div class="sub">${L.nulls.length} shuffled reruns so far (${L.luck_tests_total} in total)</div></div>
+      <div class="stat"><div class="label">$1,000 per blind trade</div><div class="value ${tone(r.blind_total)}">${r.blind_total >= 0 ? "+" : "−"}$${Math.abs(Math.round(r.blind_total * L.dollars_per_trade)).toLocaleString()}</div><div class="sub">before any real money: paper only</div></div>`;
+    const bins = [-0.6, -0.4, -0.3, -0.2, -0.1, 0, 0.1, 0.2, 0.3, 0.5, 1, 9];
+    const labels = bins.slice(0, -1).map((b, i) => `${pct(b)} to ${i === bins.length - 2 ? "more" : pct(bins[i + 1])}`);
+    const counts = bins.slice(0, -1).map((b, i) => L.nulls.filter(v => v >= b && v < bins[i + 1]).length);
+    const realBin = r.blind_avg == null ? -1 : bins.findIndex((b, i) => r.blind_avg >= b && r.blind_avg < bins[i + 1]);
+    const top = Math.max(1, ...counts);
+    draw("labNullChart", { type: "bar", data: { labels, datasets: [
+      { label: "Shuffled runs", data: counts, backgroundColor: "#4b5563", stack: "a" },
+      { label: "The real result", data: labels.map((_, i) => i === realBin ? top : null), backgroundColor: "rgba(63,185,80,.85)",
+        stack: "b", barPercentage: 0.35 }] },
+      options: { plugins: { tooltip: { callbacks: { label: c => c.datasetIndex ? `The real blind result: ${pct(r.blind_avg)} per trade`
+        : `${c.raw} shuffled runs` } } }, scales: { x: { stacked: true }, y: { title: { display: true, text: "shuffled runs" }, ticks: { precision: 0 } } } } });
+    const up = (r.blind_total || 0) >= 0;
+    draw("labCurveChart", { type: "line", data: { labels: L.curve.map((c, i) => `${dayShort(c[0])} #${i + 1}`),
+      datasets: [{ data: L.curve.map(c => c[1]), borderColor: up ? "#3fb950" : "#f85149", pointRadius: 2,
+        backgroundColor: up ? "rgba(63,185,80,.12)" : "rgba(248,81,73,.12)", fill: true, tension: .15 }] },
+      options: { plugins: { legend: { display: false }, tooltip: { callbacks: { label: c => "$" + Math.round(c.raw).toLocaleString() } } },
+        scales: { y: { ticks: { callback: v => "$" + Math.round(v).toLocaleString() } } } } });
+    const stratTxt = s => `${s.filters.map(esc).join(" + ")} → ${esc(s.entry)}; ${esc(s.exit)}`;
+    $("#labTrades").innerHTML = `<tr><th>Day</th><th>Contract</th><th>Strategy it used (found on earlier days)</th><th class="num">Result</th></tr>` +
+      (L.trades.length ? L.trades.map(t => `<tr class="click" data-id="${t.pick_id}"><td>${dayShort(t.day)} ${esc(t.trade_time_et)}</td>
+        <td>${esc(t.ticker)} ${strike(t.strike)} ${pcWord(t.put_call)} ${esc(t.expiration.slice(5))}</td>
+        <td class="muted" style="white-space:normal;min-width:420px">${stratTxt(t.strategy)}</td>
+        <td class="num ${tone(t.ret)}">${pct(t.ret)}</td></tr>`).join("") : `<tr><td colspan="4" class="muted">No blind trades yet.</td></tr>`);
+    $("#labTop").innerHTML = `<tr><th>#</th><th>Strategy</th><th class="num">Trades</th><th class="num">Avg (hindsight)</th></tr>` +
+      L.top.slice(0, 10).map((s, i) => `<tr><td>${i + 1}</td><td style="white-space:normal;min-width:520px">${stratTxt(s)}</td>
+        <td class="num">${s.n_in_sample}</td><td class="num ${tone(s.avg_in_sample)}">${pct(s.avg_in_sample)}</td></tr>`).join("");
+  } catch (e) {
+    $("#labStatus").innerHTML = `<div class="error">Couldn't load the Lab: ${esc(e.message)}</div>`;
+  }
+}
+$("#labTrades").addEventListener("click", e => {
+  const row = e.target.closest("tr[data-id]"); if (row) openDetail(row.dataset.id);
+});
+
 // ---------- predictions ----------
 let predScope = "mine";
 async function loadPredictions() {
@@ -649,7 +704,7 @@ function renderHelp() {
 
 // ---------- navigation ----------
 const LOADERS = { live: () => loadList(), learning: () => loadLearning(), predictions: () => loadPredictions(),
-  contest: () => loadContest() };
+  contest: () => loadContest(), lab: () => loadLab() };
 
 function showView(view) {
   if (view === "detail" && state.view !== "detail") state.prevView = state.view;
@@ -677,7 +732,7 @@ function openDetail(id) {
   state.detailId = id;
   showView("detail");
   $("#back").textContent = { learning: "← Back to Learning", predictions: "← Back to Predictions",
-    contest: "← Back to the Contest" }[state.prevView] || "← Back to all pings";
+    contest: "← Back to the Contest", lab: "← Back to the Lab" }[state.prevView] || "← Back to all pings";
   $("#detail").innerHTML = '<p class="muted">Loading…</p>';
   loadDetail();
 }
