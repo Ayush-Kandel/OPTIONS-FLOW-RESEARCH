@@ -176,7 +176,10 @@ DERIVED_COLUMNS = {
         # the realistic TRADE result (see trade_result): buy at the ask right after the print, sell at
         # +30% / -50% / the 4 PM bid, after fees - what following the whale would really have earned
         "trade_ret": "REAL", "trade_exit": "TEXT",
+        # which strategy (strategies.py) the model and each judge would trade this pick with
+        "pred_strategy": "TEXT", "hermes_strategy": "TEXT", "qwen_strategy": "TEXT",
     },
+    "replay_preds": {"strategy": "TEXT"},
     "model_runs": {
         "target": "TEXT", "n_rows": "INTEGER", "base_rate_hit": "REAL", "cv_mae": "REAL",
         "cv_spearman": "REAL", "cv_hit_rate": "REAL", "cv_n_hit": "INTEGER",
@@ -520,6 +523,8 @@ def update_true_outcomes(db):
             db.execute("UPDATE picks SET true_source = 'te_unconfirmed' WHERE id = ?", (pid,))
     db.commit()
     update_trade_results(db)
+    import strategies
+    strategies.compute_all(db)   # every graded pick replayed under every strategy, on real IBKR prices
     return dict(db.execute("SELECT true_source, COUNT(*) FROM picks WHERE true_source IS NOT NULL "
                            "GROUP BY 1").fetchall())
 
@@ -786,6 +791,8 @@ def _frame(db, ids, columns=None):
 WF_MIN_TRAIN = 12                       # picks needed before a replay day can be predicted
 PING_THRESHOLDS = [0.20, 0.30, 0.40, 0.50]     # for spike guesses (expected best gain)
 PROFIT_PREFIX = "profit:"                       # models trained on the real trade result (trade_ret)
+PICKER_PREFIX = "picker:"                       # one model per strategy; trades each pick with its best one
+PICKER_MAKERS = ["linear", "boosting", "similar_trades"]
 PROFIT_THRESHOLDS = [0.0, 0.03, 0.06, 0.10, 0.15, 0.20]   # profit guesses: take when expected profit >= this
 MIN_TAKEN_SHARE, MIN_TAKEN = 0.05, 8           # a rule must take enough replay trades to be trusted
 
@@ -921,6 +928,15 @@ def train(db):
     makers = _candidates()
     kinds = (list(makers) + [f"{k}+{j}" for k in makers for j in LLM_SOURCES] + LLM_SOURCES
              + [PROFIT_PREFIX + k for k in makers])
+    # strategy library: every pick's real result under every strategy (NaN = not recorded / not possible)
+    import strategies
+    strat_keys = list(strategies.STRATEGIES)
+    by_pick = strategies.results(db)
+    R = np.array([[by_pick.get(r[0], {}).get(s, (np.nan, ""))[0] for s in strat_keys] for r in rows], dtype=float)
+    # when each result became KNOWN (its exit date): training for day D may only use results closed before D
+    E = np.array([[by_pick.get(r[0], {}).get(s, (np.nan, "9999"))[1] or "9999" for s in strat_keys] for r in rows])
+    pickers = [m for m in PICKER_MAKERS if m in makers]
+    picked = {m: {"pred": [], "real": [], "choice": []} for m in pickers}
 
     # Replay: for each day with enough history, train on earlier days only and predict it.
     preds = {k: [] for k in kinds}
@@ -950,12 +966,49 @@ def train(db):
             if preds[kind] is not None:
                 preds[kind].extend(_predict_with(kind, fitted.get(base_kind), X[test_mask],
                                                  test_llm, fill))
+        # strategy pickers: one model per strategy predicts its result; each pick goes to its best
+        # strategy among those recorded for it (0DTE can't be held overnight, expiries not yet reached
+        # have no result) and is taken when that expected result clears the rule
+        real_s = R[test_mask]
+        for m in pickers:
+            est_s = np.full(real_s.shape, np.nan)
+            for j in range(len(strat_keys)):
+                tr = train_mask & ~np.isnan(R[:, j]) & (E[:, j] < day)   # no peeking at later exits
+                if tr.sum() < WF_MIN_TRAIN:
+                    continue
+                try:
+                    est = _fit_weighted(makers[m](int(tr.sum())), X[tr], R[tr, j], np.ones(int(tr.sum())))
+                    est_s[:, j] = est.predict(X[test_mask])
+                except Exception as e:
+                    print(f"  ({PICKER_PREFIX}{m}/{strat_keys[j]} failed on {day}: {type(e).__name__}; skipped)")
+            usable = np.where(~np.isnan(real_s) & ~np.isnan(est_s), est_s, -np.inf)
+            choice = usable.argmax(axis=1)
+            best = usable.max(axis=1)
+            picked[m]["pred"].extend(np.where(np.isfinite(best), best, -1.0))
+            picked[m]["real"].extend(np.where(np.isfinite(best), real_s[np.arange(len(choice)), choice], profit[test_mask]))
+            picked[m]["choice"].extend(strat_keys[c] if np.isfinite(b) else "standard" for c, b in zip(choice, best))
         truth.extend(actual[test_mask])
         truth_profit.extend(profit[test_mask])
         replay_ids.extend(int(i) for i in row_ids[test_mask])
     truth, truth_profit = np.array(truth), np.array(truth_profit)
-    board = [{"kind": k, **_score_predictions(k, np.array(v), truth, truth_profit)}
+    # live pings never follow a whale that SOLD (a bid-side print or the sold leg of a spread), so the
+    # blind test can't take those trades either
+    import trade_context
+    sold_ids = {r[0] for r in db.execute("SELECT pick_id FROM pick_context WHERE status = 'ok' AND "
+                                         "(our_leg = 'sold' OR (structure IS NULL AND side = 'sell'))")}
+    sold = np.array([i in sold_ids for i in replay_ids], dtype=bool)
+    never = lambda p: np.where(sold, -9.0, np.array(p, dtype=float))
+    board = [{"kind": k, **_score_predictions(k, never(v), truth, truth_profit)}
              for k, v in preds.items() if v]
+    for m in pickers:
+        if len(picked[m]["pred"]) == len(truth):
+            picked[m]["pred"] = list(never(picked[m]["pred"]))
+            row = {"kind": PICKER_PREFIX + m, **_score_predictions(PROFIT_PREFIX, np.array(picked[m]["pred"]), truth,
+                                                                  np.array(picked[m]["real"]))}
+            chosen = np.array(picked[m]["pred"]) >= row["threshold"]
+            row["strategies"] = {s: int(sum(1 for c, k in zip(picked[m]["choice"], chosen) if k and c == s))
+                                 for s in strat_keys}
+            board.append(row)
     # decided by blind-test trading profit; a method that never took enough trades ranks last
     board.sort(key=lambda s: -(s["profit_avg"] if s["profit_avg"] is not None else -1e9))
     winner = board[0] if board else {"kind": "linear", "threshold": PING_MIN_GAIN, "hit": None, "n_pings": 0,
@@ -964,26 +1017,38 @@ def train(db):
     base_profit = float(truth_profit.mean()) if len(truth_profit) else None
 
     kind = winner["kind"]
-    if kind.startswith(PROFIT_PREFIX):
+    strategy_estimators = None
+    if kind.startswith(PICKER_PREFIX):
+        m = kind[len(PICKER_PREFIX):]
+        est, strategy_estimators = None, {}
+        for j, s in enumerate(strat_keys):
+            tr = ~np.isnan(R[:, j])
+            if tr.sum() >= WF_MIN_TRAIN:
+                strategy_estimators[s] = _fit_weighted(makers[m](int(tr.sum())), X[tr], R[tr, j], np.ones(int(tr.sum())))
+    elif kind.startswith(PROFIT_PREFIX):
         est = _fit_weighted(makers[kind[len(PROFIT_PREFIX):]](int(has_trade.sum())), X[has_trade],
                             profit[has_trade], np.ones(int(has_trade.sum())))
     else:
         base_kind = kind.split("+")[0]
         est = _fit_weighted(makers[base_kind](n), X, y, w) if base_kind not in LLM_SOURCES else None
-    target_name = "trade_profit" if kind.startswith(PROFIT_PREFIX) else TARGET_NAME
+    target_name = "trade_profit" if kind.startswith((PROFIT_PREFIX, PICKER_PREFIX)) else TARGET_NAME
     version = datetime.now().strftime("%Y%m%d-%H%M")
     MODEL_DIR.mkdir(exist_ok=True)
-    bundle = {"kind": kind, "estimator": est, "features": FEATURES, "version": version, "n": n,
-              "target": target_name, "hermes_fill": float(np.median(actual)),
+    bundle = {"kind": kind, "estimator": est, "strategy_estimators": strategy_estimators, "features": FEATURES,
+              "version": version, "n": n, "target": target_name, "hermes_fill": float(np.median(actual)),
               "ping_threshold": winner["threshold"], "base_rate_hit": base, "replay": winner,
               "replay_days": replay_days, "leaderboard": board, "sources": sources,
               "n_graded": int(graded.sum()), "base_profit": base_profit}
     joblib.dump(bundle, MODEL_DIR / f"model_{version}.joblib")
     joblib.dump(bundle, MODEL_DIR / "latest.joblib")
     db.execute("DELETE FROM replay_preds")
-    if preds.get(kind):
-        db.executemany("INSERT INTO replay_preds (pick_id, kind, pred, version) VALUES (?, ?, ?, ?)",
-                       [(pid, kind, float(p), version) for pid, p in zip(replay_ids, preds[kind])])
+    if kind.startswith(PICKER_PREFIX):
+        p = picked[kind[len(PICKER_PREFIX):]]
+        db.executemany("INSERT INTO replay_preds (pick_id, kind, pred, version, strategy) VALUES (?, ?, ?, ?, ?)",
+                       [(pid, kind, float(v), version, s) for pid, v, s in zip(replay_ids, p["pred"], p["choice"])])
+    elif preds.get(kind):
+        db.executemany("INSERT INTO replay_preds (pick_id, kind, pred, version, strategy) VALUES (?, ?, ?, ?, ?)",
+                       [(pid, kind, float(p), version, "standard") for pid, p in zip(replay_ids, preds[kind])])
     db.execute(
         "INSERT INTO model_runs (run_utc, status, version, target, n_rows, base_rate_hit, cv_mae, "
         "cv_spearman, cv_hit_rate, cv_n_hit, model_kind, ping_threshold, leaderboard, cv_profit_avg, "
@@ -1035,18 +1100,29 @@ def score_pick(db, pick_id):
     if bundle is None:
         return None
     cols = bundle.get("features", FEATURES)
-    if set(cols) - set(FEATURES) and bundle.get("estimator") is not None:
+    if set(cols) - set(FEATURES) and (bundle.get("estimator") is not None or bundle.get("strategy_estimators")):
         print(f"Model {bundle.get('version')} uses inputs that no longer exist - not scoring; it is "
               "replaced at the next nightly retrain (or run: py flow_logger.py --train)")
         return None
     import numpy as np
-    h, q = db.execute("SELECT hermes_expected_gain, qwen_expected_gain FROM picks WHERE id = ?",
-                      (pick_id,)).fetchone()
-    llm = {"hermes": np.array([np.nan if h is None else h]), "qwen": np.array([np.nan if q is None else q])}
-    pred = float(_predict_with(bundle["kind"], bundle["estimator"], _frame(db, [pick_id], cols), llm,
-                               bundle["hermes_fill"])[0])
-    db.execute("UPDATE picks SET pred_max_gain = ?, model_version = ? WHERE id = ?",
-               (pred, bundle["version"], pick_id))
+    h, q, dte = db.execute("SELECT hermes_expected_gain, qwen_expected_gain, dte_days FROM picks WHERE id = ?",
+                           (pick_id,)).fetchone()
+    strategy = "standard"
+    if bundle["kind"].startswith(PICKER_PREFIX):
+        # the strategy picker: each strategy's own model predicts its result; trade the best one
+        import strategies
+        X = _frame(db, [pick_id], cols)
+        guesses = {s: float(e.predict(X)[0]) for s, e in (bundle.get("strategy_estimators") or {}).items()
+                   if s in strategies.applicable(dte)}
+        if not guesses:
+            return None
+        strategy, pred = max(guesses.items(), key=lambda kv: kv[1])
+    else:
+        llm = {"hermes": np.array([np.nan if h is None else h]), "qwen": np.array([np.nan if q is None else q])}
+        pred = float(_predict_with(bundle["kind"], bundle["estimator"], _frame(db, [pick_id], cols), llm,
+                                   bundle["hermes_fill"])[0])
+    db.execute("UPDATE picks SET pred_max_gain = ?, model_version = ?, pred_strategy = ? WHERE id = ?",
+               (pred, bundle["version"], strategy, pick_id))
     db.commit()
     return pred
 
@@ -1083,6 +1159,15 @@ def _hermes_memory(db, trade_date, ticker=None, put_call=None, dte=None, judge="
                                 f"AND {judge}_verdict = ?", (PING_MIN_GAIN, trade_date, verdict)).fetchone()
             if vk:
                 lines.append(f"  your '{verdict}' calls: {vh or 0} of {vk} reached +{PING_MIN_GAIN:.0%}")
+        import strategies
+        strategies.ensure_schema(db)
+        tk_n, tk_avg, tk_won = db.execute(
+            f"SELECT COUNT(*), AVG(r.ret), AVG(r.ret > 0) FROM picks p JOIN strategy_results r ON r.pick_id = p.id "
+            f"AND r.strategy = COALESCE(p.{judge}_strategy, 'standard') WHERE substr(r.exit_minute, 1, 10) < ? "
+            f"AND p.{judge}_verdict = 'take'", (trade_date,)).fetchone()   # only trades closed before that day
+        if tk_n:
+            lines.append(f"  YOUR TRADING RECORD: your {tk_n} 'take' calls, traded with the strategy you chose, "
+                         f"averaged {tk_avg:+.0%} per trade after costs and made money {tk_won:.0%} of the time.")
         lines.append("  Use this to calibrate: spread your estimates out and say 'skip' when a pick "
                      "looks like past losers.")
 
@@ -1168,8 +1253,18 @@ def judge(db, pick_id, name):
     greeks_txt = (f"IV {iv:.0%}, delta {delta:.2f}, gamma {gamma:.4f}, theta ${theta:.2f}/day per share "
                   f"({theta / fill:.1%} of the price per day), vega {vega:.2f}"
                   if iv is not None else "unknown (no stock price at the print)")
+    import strategies
+    import trade_context
+    ctx = trade_context.get(db, pick_id)
+    side_txt = ("unknown" if not ctx or ctx["status"] not in ("ok", "side_only") else
+                {"buy": "the whale BOUGHT at the ask", "sell": "the whale SOLD at the bid",
+                 "mid": "traded between bid and ask (unclear)"}[ctx["side"]]
+                + (f"; part of a {ctx['structure']} - this contract was the leg {ctx['our_leg']}"
+                   if ctx.get("structure") else ""))
     facts = (
-        _hermes_memory(db, trade_date, ticker, put_call, dte, judge=name) + "\nNEW PICK TO JUDGE\n"
+        _hermes_memory(db, trade_date, ticker, put_call, dte, judge=name)
+        + strategies.memory(db, trade_date, ticker, dte) + "\nNEW PICK TO JUDGE\n"
+        f"Whale side: {side_txt}\n"
         f"Ticker: {ticker}\nContract: {contract} ({put_call}), {dte} days to expiry\n"
         f"Print: {size} contracts @ ${fill} = ${premium:,.0f} premium at {hhmm} ET on {trade_date}\n"
         f"Trade Echo noteworthy score: {score}; flags: {', '.join(json.loads(flags or '[]')) or 'none'}\n"
@@ -1181,10 +1276,13 @@ def judge(db, pick_id, name):
         f"Same-contract prints in the last 30 min: {f['repeat_30m']}; call share of this "
         f"ticker's premium in the last 30 min: {fmt(f['flow_call_share_30m'])}\n")
     question = (
-        f"Estimate the highest BID (the best price you could sell at) this option will reach after "
-        f"{hhmm} ET and before today's close, as a % gain over the ${fill} fill. Reply with JSON only: "
-        '{"expected_max_gain_pct": number (e.g. 25 for +25%), '
-        f'"verdict": "take" if you expect at least +{PING_MIN_GAIN * 100:.0f}% else "skip", '
+        f"1) Estimate the highest BID (the best price you could sell at) this option will reach after "
+        f"{hhmm} ET and before today's close, as a % gain over the ${fill} fill. 2) You would buy at the ask "
+        "right after the whale's trade: choose the ONE strategy from the playbook most likely to make money "
+        "on this trade, and say 'take' only if you expect it to make money after costs - otherwise 'skip' "
+        "(most whale trades lose money, so skip freely). Reply with JSON only: "
+        '{"expected_max_gain_pct": number (e.g. 25 for +25%), "verdict": "take" or "skip", '
+        f'"strategy": one of {list(strategies.STRATEGIES)}, '
         '"confidence": 0-100, "reason": "one short sentence"}')
     body = json.dumps({
         "model": cfg["model"],
@@ -1194,8 +1292,10 @@ def judge(db, pick_id, name):
         "options": {"temperature": 0.2, "num_ctx": cfg["num_ctx"]},
         **cfg["extra"],
         "messages": [
-            {"role": "system", "content": "You are a careful options-flow analyst. Judge only from "
-             "the facts given, and learn from the past outcomes listed."},
+            {"role": "system", "content": "You are a careful options-flow trader. Judge only from the facts "
+             "given, and learn from the past outcomes listed. Never follow a whale that SOLD the contract.\n"
+             "STRATEGY PLAYBOOK (every strategy buys this contract at the ask right after the whale's trade):\n"
+             + strategies.playbook()},
             {"role": "user", "content": facts + "\n" + question},
         ],
     }).encode("utf-8")
@@ -1210,9 +1310,11 @@ def judge(db, pick_id, name):
         conf = reply.get("confidence")
         conf = float(conf) if isinstance(conf, (int, float)) else None
         reason = str(reply.get("reason") or "")[:300]
+        strategy = str(reply.get("strategy") or "").strip().lower()
+        strategy = strategy if strategy in strategies.STRATEGIES else None
         db.execute(f"UPDATE picks SET {name}_verdict = ?, {name}_expected_gain = ?, {name}_confidence = ?, "
-                   f"{name}_reason = ?, {name}_error = NULL WHERE id = ?",
-                   (verdict, est, conf, reason, pick_id))
+                   f"{name}_reason = ?, {name}_strategy = ?, {name}_error = NULL WHERE id = ?",
+                   (verdict, est, conf, reason, strategy, pick_id))
         db.commit()
         return verdict, est, reason
     except (urllib.error.URLError, TimeoutError, OSError, ValueError, KeyError) as e:
@@ -1340,9 +1442,16 @@ def pick_block(db, pick_id, with_model=False):
         import trade_context
         lines.append(trade_context.describe(trade_context.get(db, pick_id)))
     if with_model and pred is not None:
-        profit_model = (_load_model() or {}).get("kind", "").startswith(PROFIT_PREFIX)
-        lines.append(f"Model: expected trade result **{pred:+.0%}** (buy at the ask now, sell at +30%/-50%/4 PM)"
-                     if profit_model else f"Model: expected best gain today **{pred:+.0%}**")
+        import strategies
+        kind = (_load_model() or {}).get("kind", "")
+        play = db.execute("SELECT pred_strategy FROM picks WHERE id = ?", (pick_id,)).fetchone()[0] or "standard"
+        s = strategies.STRATEGIES.get(play, strategies.STRATEGIES["standard"])
+        if kind.startswith(PICKER_PREFIX):
+            lines.append(f"🎯 **Play: {s['name']}** - {s['about']} Model expects **{pred:+.0%}** (buy at the ask now).")
+        elif kind.startswith(PROFIT_PREFIX):
+            lines.append(f"Model: expected trade result **{pred:+.0%}** (buy at the ask now, sell at +30%/-50%/4 PM)")
+        else:
+            lines.append(f"Model: expected best gain today **{pred:+.0%}**")
     d = datetime.strptime(tdate, "%Y-%m-%d")
     lines.append(_stats_line(f"Day {d:%m/%d}", d_status, fill, d_high, d_low, d_avg, d_close,
                              "after today's close"))
@@ -1624,7 +1733,7 @@ def scorecard(db, trade_date, result):
                if row.get("profit_avg") is not None else "too few trades")
         lines.append(f"  {'🏆' if row['kind'] == result['kind'] else '•'} {row['kind']}: {res} "
                      f"(takes >= {row['threshold']:+.0%})")
-    unit = "expected trade profit" if result["kind"].startswith(PROFIT_PREFIX) else "expected best gain"
+    unit = "expected trade profit" if result["kind"].startswith((PROFIT_PREFIX, PICKER_PREFIX)) else "expected best gain"
     lines.append(f"Tomorrow: **{result['kind']}** pings when its {unit} is {result['threshold']:+.0%} or more.")
     return "\n".join(lines)
 
@@ -1851,7 +1960,7 @@ def _describe(result):
     pa, bp = result.get("profit_avg"), result.get("base_profit")
     board = ", ".join(f"{r['kind']} {r['profit_avg']:+.1%}/trade x{r['n_pings']}" if r.get("profit_avg") is not None
                       else f"{r['kind']} (too few trades)" for r in result.get("board", [])[:5])
-    unit = "expected profit" if result["kind"].startswith(PROFIT_PREFIX) else "expected best gain"
+    unit = "expected profit" if result["kind"].startswith((PROFIT_PREFIX, PICKER_PREFIX)) else "expected best gain"
     return (f"winner '{result['kind']}' on {result['n']} picks; replay of {result['replay_days']} days "
             f"({result['replay_n']} picks): takes trades when its {unit} >= {result['threshold']:+.0%} -> "
             f"{result['n_hit']} trades, avg {'n/a' if pa is None else f'{pa:+.1%}'} per trade after fees "

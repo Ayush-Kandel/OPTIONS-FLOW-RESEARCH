@@ -8,6 +8,7 @@ happened. All grading uses IBKR outcomes only (the best BID after the print), li
 
 import json
 import time
+from collections import Counter
 from contextlib import closing
 
 import numpy as np
@@ -87,11 +88,23 @@ def learning():
     replay = [{"day": d, "n_all": len(v["all"]), "hit_all": _share(v["all"]), "n_model": len(v["model"]),
                "hit_model": _share(v["model"]), "avg_model": _avg(v["model"]), "avg_all": _avg(v["all"])}
               for d, v in sorted(days.items())]
+    import strategies
+    with closing(_db()) as db:
+        has_sr = db.execute("SELECT 1 FROM sqlite_master WHERE name = 'strategy_results'").fetchone()
+        srows = db.execute("SELECT strategy, COUNT(*), AVG(ret), AVG(ret > 0), "
+                           "AVG(CASE WHEN p.dte_days <= 0 THEN ret END), AVG(CASE WHEN p.dte_days > 0 THEN ret END) "
+                           "FROM strategy_results r JOIN picks p ON p.id = r.pick_id GROUP BY strategy").fetchall() if has_sr else []
+        has_rs = "strategy" in {r[1] for r in db.execute("PRAGMA table_info(replay_preds)")}
+        picks_by = dict(db.execute("SELECT strategy, COUNT(*) FROM replay_preds WHERE version = ? AND pred >= ? GROUP BY 1",
+                                   (run["version"], bar)).fetchall()) if run and has_rs else {}
+    strat_board = sorted(({"key": k, "name": strategies.STRATEGIES[k]["name"], "about": strategies.STRATEGIES[k]["about"],
+                           "n": n, "avg": avg, "win": win, "avg_0dte": a0, "avg_longer": a1, "model_picks": picks_by.get(k, 0)}
+                          for k, n, avg, win, a0, a1 in srows if k in strategies.STRATEGIES), key=lambda s: -s["avg"])
     corr = json.loads(analyst[0]).get("feature_corr", {}) if analyst else {}
     inputs = [{"name": FEATURE_WORDS.get(k, k.replace("_", " ")), "key": k, "corr": v[0], "n": v[1]}
               for k, v in list(corr.items())[:10]]
     return {"runs": runs, "board": board, "winner": run["model_kind"] if run else None, "bar": bar,
-            "replay": replay, "inputs": inputs,
+            "replay": replay, "inputs": inputs, "strategies": strat_board,
             "latest": {"version": run["version"], "n": run["n_rows"], "rank": run["cv_spearman"], "hit": run["cv_hit_rate"],
                        "n_pings": run["cv_n_hit"], "base": run["base_rate_hit"], "kind": run["model_kind"],
                        "profit": run["cv_profit_avg"], "base_profit": run["base_profit_avg"],
@@ -121,9 +134,20 @@ def _sim_data():
         bar = run["ping_threshold"] if run else HIT
         replay = dict(db.execute("SELECT pick_id, pred FROM replay_preds WHERE version = ? AND kind = ?",
                                  (run["version"], run["model_kind"]))) if run else {}
+        pcols = {r[1] for r in db.execute("PRAGMA table_info(picks)")}
+        jstrat = ("p.hermes_strategy, p.qwen_strategy" if "hermes_strategy" in pcols
+                  else "NULL AS hermes_strategy, NULL AS qwen_strategy")
+        has_rs = "strategy" in {r[1] for r in db.execute("PRAGMA table_info(replay_preds)")}
+        strat_res = {}
+        if "exit_minute" in {r[1] for r in db.execute("PRAGMA table_info(strategy_results)")}:
+            for pid, s, ret, why, when in db.execute("SELECT pick_id, strategy, ret, exit, exit_minute FROM strategy_results"):
+                strat_res.setdefault(pid, {})[s] = (ret, why, when)
+        replay_strategy = dict(db.execute("SELECT pick_id, strategy FROM replay_preds WHERE version = ? AND kind = ?",
+                                          (run["version"], run["model_kind"]))) if run and has_rs else {}
         picks = db.execute(
             "SELECT p.id, p.ticker, p.strike, p.put_call, p.expiration, p.trade_date, p.trade_time_et, p.fill_price, "
-            "p.premium, p.score, p.pinged_utc, p.hermes_verdict, p.qwen_verdict, c.side, c.structure, c.our_leg FROM picks p "
+            f"p.premium, p.score, p.pinged_utc, p.hermes_verdict, p.qwen_verdict, {jstrat}, c.side, c.structure, "
+            "c.our_leg FROM picks p "
             "JOIN ib_stats s ON s.pick_id = p.id LEFT JOIN pick_context c ON c.pick_id = p.id AND c.status = 'ok' "
             "WHERE s.status = 'ok' AND s.n_bid_bars > 0 ORDER BY p.trade_date, p.trade_time_et").fetchall()
         # one indexed range read per pick (a joined string comparison can't use the index: ~10x slower)
@@ -155,6 +179,10 @@ def _sim_data():
             "close": np.array([r[3] for r in path]),
             "side": p["side"] or "unknown", "sold": sold, "structure": p["structure"],
             "takes": {"hermes": p["hermes_verdict"] == "take", "qwen": p["qwen_verdict"] == "take"},
+            # each trader's chosen strategy and every strategy's real result (strategies.py)
+            "plays": {"hermes": p["hermes_strategy"] or "standard", "qwen": p["qwen_strategy"] or "standard",
+                      "model": replay_strategy.get(p["id"]) or "standard", "all": "standard"},
+            "strategy_results": strat_res.get(p["id"], {}),
             "groups": {"all", *(["core"] if core else []), *(["mine"] if core and p["ticker"] in MY_TICKERS else []),
                        *(["model"] if replay.get(p["id"]) is not None and replay[p["id"]] >= bar else []),
                        *(["pings"] if p["pinged_utc"] else [])},
@@ -259,7 +287,13 @@ CONTESTANTS = [("hermes", "Hermes", "AI judge on this PC - buys when it says 'ta
 
 
 def _chooses(key, t):
-    return True if key == "all" else ("model" in t["groups"]) if key == "model" else t["takes"][key]
+    """The baseline buys everything; the model follows its live rule (its pick, and never a whale that
+    sold); the judges trade their own 'take' calls."""
+    if key == "all":
+        return True
+    if key == "model":
+        return "model" in t["groups"] and not t["sold"]
+    return t["takes"][key]
 
 
 def _run_account(trades):
@@ -306,10 +340,18 @@ def contest(universe="all"):
         for t in data["trades"]:
             if universe not in t["groups"] or not _chooses(key, t) or not t["ask_print"]:
                 continue
-            ret, why, exit_m = _exit(t, t["ask_print"], t["start"], CONTEST_TARGET, CONTEST_STOP)
+            play = t["plays"][key]
+            res = t["strategy_results"].get(play)
+            if res:      # the trader's own strategy, replayed on real prices
+                ret, why, exit_m = res
+                ret += 2 * FEE_PER_CONTRACT / (t["ask_print"] * 100)   # stored after fees; _run_account charges them
+            else:        # that strategy wasn't recorded for this pick: the standard exit
+                play = "standard"
+                ret, why, exit_m = _exit(t, t["ask_print"], t["start"], CONTEST_TARGET, CONTEST_STOP)
             if ret is not None:
                 trades.append((t["start"], exit_m, t["ask_print"], ret, t))
                 t.setdefault("_why", {})[key] = why
+                t.setdefault("_play", {})[key] = play
         final, log, by_day, skipped = _run_account(trades)
         curve, value = [], CONTEST_CASH
         for d in days:                      # end-of-day account value, carried over quiet days
@@ -327,9 +369,14 @@ def contest(universe="all"):
             "best": max(pnls) if pnls else None, "worst": min(pnls) if pnls else None, "curve": curve,
             "log": [{"start": r["start"], "contract": r["contract"], "entry": r["entry"], "stake": round(r["stake"], 2),
                      "ret": r["ret"], "pnl": round(r["pnl"], 2), "id": r["id"],
-                     "why": by_id[r["id"]].get("_why", {}).get(key)} for r in sorted(log, key=lambda r: r["start"], reverse=True)[:80]],
+                     "why": by_id[r["id"]].get("_why", {}).get(key), "play": by_id[r["id"]].get("_play", {}).get(key)}
+                    for r in sorted(log, key=lambda r: r["start"], reverse=True)[:80]],
+            "plays": dict(Counter(by_id[r["id"]].get("_play", {}).get(key) for r in log)),
         })
-    return {"universe": universe, "days": days, "traders": out, "rules": {"cash": CONTEST_CASH, "size": CONTEST_SIZE, "target": CONTEST_TARGET,
+    import strategies
+    return {"universe": universe, "days": days, "traders": out,
+            "strategy_names": {k: s["name"] for k, s in strategies.STRATEGIES.items()},
+            "rules": {"cash": CONTEST_CASH, "size": CONTEST_SIZE, "target": CONTEST_TARGET,
                                                     "stop": CONTEST_STOP, "fee": FEE_PER_CONTRACT}}
 
 
