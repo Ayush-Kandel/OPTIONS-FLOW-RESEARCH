@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FlowDesk</title>
+<link rel="icon" href="flowdesk.ico">
+<link rel="stylesheet" href="app.css">
+<script src="https://unpkg.com/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"></script>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand"><span class="logo">◆</span> FlowDesk</div>
+  <nav class="tabs" id="tabs">
+    <button data-tab="live" class="active">Live</button>
+    <button data-tab="predictions">Predictions <span class="soon">soon</span></button>
+    <button data-tab="learning">Learning <span class="soon">soon</span></button>
+    <button data-tab="help">Help</button>
+  </nav>
+  <div class="health" id="health"></div>
+</header>
+
+<main>
+  <!-- LIVE: list of pinged contracts -->
+  <section id="view-live" class="view">
+    <p class="intro">
+      These are the big option trades (<b>whales</b>) our system pinged you about.
+      <b>P&amp;L</b> shows what you would have now if you had bought at the whale's price and sold at the
+      current <span class="term" data-tip="bid">bid</span>. Click any card to see its full chart.
+    </p>
+    <div class="stats" id="stats"></div>
+    <div class="toolbar">
+      <div class="segmented" id="scope">
+        <button data-scope="open" class="active">Still open</button>
+        <button data-scope="session">Last session</button>
+        <button data-scope="all">All pings</button>
+      </div>
+      <span class="updated" id="updated"></span>
+    </div>
+    <div class="cards" id="cards"></div>
+  </section>
+
+  <!-- DETAIL: one contract -->
+  <section id="view-detail" class="view hidden">
+    <button class="back" id="back">← Back to all pings</button>
+    <div id="detail"></div>
+  </section>
+
+  <section id="view-predictions" class="view hidden">
+    <div class="coming">
+      <h2>Predictions <span class="soon">Phase 2</span></h2>
+      <p>What the model and the two AI judges (Hermes and Qwen) expected for each contract, next to what really
+        happened, plus a running scorecard of who is right more often.</p>
+      <p class="muted">For now, every contract's page already shows the model's target line and the judges' guesses.</p>
+    </div>
+  </section>
+
+  <section id="view-learning" class="view hidden">
+    <div class="coming">
+      <h2>Learning <span class="soon">Phase 3</span></h2>
+      <p>How the models train and get tested, shown as pictures: each night's training run, which model won,
+        a day-by-day replay of predicted vs. real results, and an exit-strategy simulator (for example
+        "take profit at +30%" vs. "hold to the close").</p>
+    </div>
+  </section>
+
+  <section id="view-help" class="view hidden">
+    <div class="help" id="help"></div>
+  </section>
+</main>
+
+<div class="tooltip hidden" id="tooltip"></div>
+<script src="app.js"></script>
+</body>
+</html>

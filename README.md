@@ -48,7 +48,9 @@ The nightly contest replays past days walk-forward (train only on earlier days, 
 | `ibkr.py` | Read-only IBKR data: 1-minute bars, honest outcomes, Greeks paths, live tracker, entry quotes |
 | `bots.py` | Simulator (backtests + exit-plan grid), Analyst, Judges report, Scout |
 | `integrity.py` | 27 rule-based data-integrity checks + a local Qwen audit whose findings are re-verified by code |
-| `dashboard.py` | Live local dashboard at http://localhost:8050 |
+| `flow_app.py`, `app_data.py`, `ui/` | **FlowDesk** desktop app: live P&L of every ping since the whale's fill, per-contract charts, model vs. reality (read-only) |
+| `cases.py` | Incident cases: evidence -> local Qwen investigation -> verified write-up in `cases/` + Discord |
+| `dashboard.py` | Operator dashboard at http://localhost:8050 (what every bot is doing) |
 | `greeks.py` | Black-Scholes IV and Greeks (no API calls) |
 | `tradeecho_probe.py` | Minimal Trade Echo MCP client (Streamable HTTP, JSON-RPC) |
 | `run_logger.ps1`, `run_ibkr_live.ps1` | Restart loops started by Windows Task Scheduler |
@@ -89,6 +91,15 @@ py flow_logger.py --bots     # Simulator, Analyst and Judges reports
 py flow_logger.py --dashboard
 py flow_logger.py --help     # everything else
 ```
+
+### FlowDesk (desktop app)
+
+```bash
+pythonw flow_app.py          # opens the app window (the FlowDesk desktop shortcut runs this)
+py flow_app.py --browser     # serve only, at http://127.0.0.1:8060
+```
+
+FlowDesk only reads `flow.db`: it never connects to IBKR or Trade Echo and never writes, so it can't disturb the logger, the IBKR tracker or the Discord pings. Phase 1 is the **Live** screen (every pinged contract, P&L from the whale's fill to the live bid, click-through charts with the whale's buy, ping time, alerts and the model's target). **Predictions** (Phase 2) and **Learning** (Phase 3: training and backtests as charts) come next. Market data is shown for personal use only.
 
 ## Data rules
 
