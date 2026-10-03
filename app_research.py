@@ -50,7 +50,8 @@ def _latest_run(db):
 
 
 def _is_profit(kind):
-    return bool(kind) and kind.startswith("profit:")
+    """Models whose guesses are a trade result (profit-trained and strategy pickers), not a spike."""
+    return bool(kind) and kind.startswith(("profit:", "picker:"))
 
 
 def _rank_corr(a, b):
