@@ -41,6 +41,8 @@ class Handler(SimpleHTTPRequestHandler):
                 data = app_data.detail(int(q["id"]))
             elif name == "learning":
                 data = app_research.learning()
+            elif name == "lab":
+                data = app_research.lab()
             elif name == "simulate":
                 num = lambda k: float(q[k]) if q.get(k) not in (None, "", "off") else None
                 data = app_research.simulate(q.get("group", "all"), q.get("side", "any"), q.get("entry", "whale"),
