@@ -27,6 +27,8 @@ const GLOSSARY = {
   judges: ["AI judges", "Two AI models running on this PC (Hermes and Qwen) that read each trade and guess its upside. They are still learning and are less accurate than the model."],
   alerts: ["Alerts", "Discord alerts that fired the first time the bid crossed +30%, +50%, +100% or -50% from the whale's price."],
   latency: ["Ping delay", "How long after the whale's trade our ping went out. By then the price may already have moved."],
+  walkforward: ["Walk-forward test", "The honest way to backtest: to judge Wednesday, the model is trained only on Monday and Tuesday, then predicts Wednesday's picks blind. No peeking at the future."],
+  rank: ["Rank agreement", "Does the model put the picks in the right order, from worst to best? 0 means random guessing, 1 means a perfect order. Anything steadily above 0.2 is useful for trading."],
   side: ["Bought or sold?", "Whether the whale was BUYING (paid the ask) or SELLING (hit the bid). Following only makes sense when the whale bought. From Trade Echo's trade sentiment, cross-checked with IBKR's own bid/ask at that minute."],
   spreadleg: ["Spread leg", "The whale traded another contract in the same second with a matching size: one multi-leg order (a vertical spread, calendar, collar...). Its real bet is the combination, not this contract alone. If this was the leg the whale SOLD, no ping is sent."],
   score: ["Flow score", "Trade Echo's 0-100 rating of how unusual and aggressive the trade was. We only consider trades above 30."],
@@ -228,11 +230,13 @@ function drawChart(d) {
 const FLAG_WORDS = {
   sweep_or_block: "a sweep or block (bought fast across exchanges, or as one big order)",
   aggressive_execution: "aggressive (paid at or above the ask - an urgent buyer)",
+  algo_edge: "flagged by Trade Echo's Algo Edge",
 };
 
 function storyHTML(d) {
   const start = d.trade_date + " " + d.time;
-  const s = [`On <b>${day(d.trade_date)} at ${clock(start)}</b>, a whale bought <b>${Number(d.size).toLocaleString()}</b> contracts of
+  const verb = { buy: "bought", sell: "sold" }[d.context && d.context.side] || "traded";
+  const s = [`On <b>${day(d.trade_date)} at ${clock(start)}</b>, a whale ${verb} <b>${Number(d.size).toLocaleString()}</b> contracts of
     <b>${esc(name(d))}</b> at <b>${money(d.fill)}</b> each (${bigMoney(d.premium)} in total).`];
   if (d.flags.length) s.push(`The trade was ${d.flags.map(f => FLAG_WORDS[f] || esc(f.replace(/_/g, " "))).join(" and ")}.`);
   if (d.context) {
@@ -353,6 +357,251 @@ async function loadDetail() {
   }
 }
 
+// ---------- charts (Chart.js) ----------
+const charts = {};
+if (window.Chart) {
+  Chart.defaults.color = "#c9d1d9";
+  Chart.defaults.borderColor = "#222a35";
+  Chart.defaults.font.family = "Segoe UI, system-ui, sans-serif";
+  Chart.defaults.maintainAspectRatio = false;
+  Chart.defaults.plugins.legend.labels.boxWidth = 12;
+}
+function draw(id, config) {
+  if (!window.Chart) { $("#" + id).parentElement.innerHTML = '<p class="muted">Chart library didn\'t load (no internet?).</p>'; return; }
+  if (charts[id]) charts[id].destroy();
+  charts[id] = new Chart($("#" + id), config);
+}
+const pctAxis = (extra = {}) => ({ ticks: { callback: v => (v > 0 ? "+" : "") + Math.round(v * 100) + "%" }, ...extra });
+function kindName(k) {
+  const base = { boosting: "Boosted trees", linear: "Linear", forest: "Random forest", knn: "Nearest neighbours",
+    similar_trades: "Similar past trades", judges: "Both AI judges alone", hermes: "Hermes alone", qwen: "Qwen alone" };
+  const extra = { judges: " + both AI judges", hermes: " + Hermes", qwen: " + Qwen" };
+  const [b, x] = k.split("+");
+  return (base[b] || b.replace(/_/g, " ")) + (x ? extra[x] || " + " + x : "");
+}
+const runTime = utc => new Date(utc).toLocaleString("en-US", { month: "short", day: "numeric", hour: "numeric", minute: "2-digit", timeZone: "America/New_York" });
+const dayShort = d => day(d).replace(/^\w+, /, "");
+
+// ---------- learning ----------
+async function loadLearning() {
+  try {
+    const L = await api("learning");
+    const x = L.latest;
+    $("#learnStats").innerHTML = x ? `
+      <div class="stat"><div class="label">Picks it learned from</div><div class="value">${x.n}</div><div class="sub">graded on real IBKR prices</div></div>
+      <div class="stat"><div class="label" data-tip="rank">Rank agreement (tested blind)</div><div class="value">${x.rank != null ? x.rank.toFixed(2) : "—"}</div><div class="sub">0 = random, 1 = perfect</div></div>
+      <div class="stat"><div class="label">The model's picks that won</div><div class="value up">${pct(x.hit).replace("+", "")}</div><div class="sub">of ${x.n_pings} picks it would ping</div></div>
+      <div class="stat"><div class="label">All picks that won</div><div class="value">${pct(x.base).replace("+", "")}</div><div class="sub">${x.base ? (x.hit / x.base).toFixed(1) + "× better when the model chooses" : ""}</div></div>` : "";
+    draw("historyChart", { type: "line", data: {
+      labels: L.runs.map(r => runTime(r.run_utc)),
+      datasets: [
+        { label: "Model's picks that won", data: L.runs.map(r => r.hit), borderColor: "#3fb950", backgroundColor: "#3fb950", tension: .25 },
+        { label: "All picks that won", data: L.runs.map(r => r.base), borderColor: "#8b949e", backgroundColor: "#8b949e", borderDash: [5, 4], tension: .25 },
+      ] }, options: { scales: { y: pctAxis({ min: 0 }) }, plugins: { tooltip: { callbacks: { label: c => `${c.dataset.label}: ${pct(c.raw).replace("+", "")}` } } } } });
+    const board = [...L.board].sort((a, b) => (b.spearman ?? -1) - (a.spearman ?? -1));
+    draw("boardChart", { type: "bar", data: {
+      labels: board.map(b => kindName(b.kind)),
+      datasets: [{ label: "Rank agreement", data: board.map(b => b.spearman),
+        backgroundColor: board.map(b => b.kind === L.winner ? "#3fb950" : "#30598f") }] },
+      options: { indexAxis: "y", plugins: { legend: { display: false } }, scales: { x: { min: 0 } } } });
+    draw("replayChart", { type: "bar", data: {
+      labels: L.replay.map(d => dayShort(d.day)),
+      datasets: [
+        { label: "Model's picks", data: L.replay.map(d => d.hit_model), backgroundColor: "#3fb950" },
+        { label: "All picks", data: L.replay.map(d => d.hit_all), backgroundColor: "#4b5563" },
+      ] }, options: { scales: { y: pctAxis({ min: 0, max: 1 }) }, plugins: { tooltip: { callbacks: {
+        label: c => { const d = L.replay[c.dataIndex]; const model = c.datasetIndex === 0;
+          return `${c.dataset.label}: ${c.raw == null ? "none" : pct(c.raw).replace("+", "")} won (${model ? d.n_model : d.n_all} picks)`; } } } } } });
+    draw("inputsChart", { type: "bar", data: {
+      labels: L.inputs.map(i => i.name),
+      datasets: [{ data: L.inputs.map(i => i.corr), backgroundColor: L.inputs.map(i => i.corr >= 0 ? "#3fb950" : "#f85149") }] },
+      options: { indexAxis: "y", plugins: { legend: { display: false } }, scales: { x: { min: -0.6, max: 0.6 } } } });
+    initSim();
+  } catch (e) {
+    $("#learnStats").innerHTML = `<div class="error">Couldn't load: ${esc(e.message)}</div>`;
+  }
+}
+
+// ---------- exit simulator ----------
+const TARGETS = [null, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0, 1.5, 2.0];
+const STOPS = [-0.10, -0.25, -0.50, -0.75, null];
+let simReady = false, simTimer = null;
+function simParams() {
+  return { group: $("#simGroup").value, side: $("#simSide").value, entry: $("#simEntry").value,
+    target: TARGETS[+$("#simTarget").value] ?? "off", stop: STOPS[+$("#simStop").value] ?? "off" };
+}
+function simLabels() {
+  const t = TARGETS[+$("#simTarget").value], s = STOPS[+$("#simStop").value];
+  $("#tgtLabel").textContent = t == null ? "off (hold to 4 PM)" : pct(t);
+  $("#stopLabel").textContent = s == null ? "off" : pct(s);
+}
+function initSim() {
+  if (simReady) return runSim(true);
+  simReady = true;
+  $("#simTarget").value = 3;
+  ["simGroup", "simSide", "simEntry"].forEach(id => $("#" + id).addEventListener("change", () => runSim(true)));
+  ["simTarget", "simStop"].forEach(id => $("#" + id).addEventListener("input", () => {
+    simLabels(); clearTimeout(simTimer); simTimer = setTimeout(() => runSim(false), 120);
+  }));
+  runSim(true);
+}
+async function runSim(withGrid) {
+  simLabels();
+  const p = simParams();
+  try {
+    const r = await api("simulate", p);
+    const s = r.stats;
+    const why = { target: "Took profit", stop: "Stopped out", close: "Sold at 4 PM" };
+    $("#simStats").innerHTML = s ? `
+      <div class="stat"><div class="label">Trades</div><div class="value">${s.n}</div><div class="sub">${r.available - s.n ? (r.available - s.n) + " skipped (entry price unknown)" : "all have prices"}</div></div>
+      <div class="stat"><div class="label">Won</div><div class="value">${pct(s.win_rate).replace("+", "")}</div><div class="sub">took profit ${s.exits.target} · stopped ${s.exits.stop} · 4 PM ${s.exits.close}</div></div>
+      <div class="stat"><div class="label">Average per trade</div><div class="value ${tone(s.avg)}">${pct(s.avg)}</div><div class="sub">median ${pct(s.median)} · best ${pct(s.best)} · worst ${pct(s.worst)}</div></div>
+      <div class="stat"><div class="label">$1,000 per trade →</div><div class="value ${tone(s.total_dollars)}">${s.total_dollars >= 0 ? "+" : "−"}$${Math.abs(Math.round(s.total_dollars)).toLocaleString()}</div><div class="sub">total over ${s.n} trades (before fees)</div></div>`
+      : `<div class="empty">No trades match these choices${p.entry === "ping" ? " - your real ask is only recorded for live pings" : ""}.</div>`;
+    const up = s && s.total_dollars >= 0;
+    draw("equityChart", { type: "line", data: { labels: r.curve.map(c => c[0]), datasets: [{ label: "Account", data: r.curve.map(c => c[1]),
+      borderColor: up ? "#3fb950" : "#f85149", backgroundColor: up ? "rgba(63,185,80,.12)" : "rgba(248,81,73,.12)", fill: true, pointRadius: 0, tension: .15 }] },
+      options: { plugins: { legend: { display: false }, tooltip: { callbacks: { label: c => `$${Math.round(c.raw).toLocaleString()}` } } },
+        scales: { x: { ticks: { maxTicksLimit: 6, callback: function (v) { return dayShort(this.getLabelForValue(v)); } } },
+          y: { ticks: { callback: v => "$" + Math.round(v).toLocaleString() } } } } });
+    draw("histChart", { type: "bar", data: { labels: r.hist.labels, datasets: [{ data: r.hist.counts,
+      backgroundColor: r.hist.labels.map((l, i) => i < 4 ? "#f85149" : "#3fb950") }] },
+      options: { plugins: { legend: { display: false } }, scales: { y: { title: { display: true, text: "trades" } } } } });
+    $("#simTrades").innerHTML = `<tr><th>When</th><th>Contract</th><th>Whale</th><th class="num">You paid</th><th class="num">Result</th><th>How it ended</th></tr>` +
+      r.trades.map(t => `<tr class="click" data-id="${t.id}"><td>${dayShort(t.day)} ${clock(t.start)}</td><td>${esc(t.contract)}</td>
+        <td>${{ buy: "bought", sell: "sold", mid: "mid", unknown: "—" }[t.side]}</td><td class="num">${money(t.entry)}</td>
+        <td class="num ${tone(t.ret)}">${pct(t.ret)}</td><td>${why[t.why]}</td></tr>`).join("");
+    if (withGrid) loadGrid(p);
+    else markGrid();
+  } catch (e) {
+    $("#simStats").innerHTML = `<div class="error">Simulator error: ${esc(e.message)}</div>`;
+  }
+}
+async function loadGrid(p) {
+  const g = await api("grid", { group: p.group, side: p.side, entry: p.entry });
+  const cell = (t, s) => g.cells.find(c => c.target === t && c.stop === s);
+  const color = v => v == null ? "transparent" : v >= 0 ? `rgba(63,185,80,${Math.min(.15 + v * 1.5, .85)})` : `rgba(248,81,73,${Math.min(.15 - v * 1.2, .85)})`;
+  $("#gridTable").innerHTML = `<tr><th>Take profit ↓ / Stop loss →</th>${g.stops.map(s => `<th>${s == null ? "No stop" : pct(s)}</th>`).join("")}</tr>` +
+    g.targets.map(t => `<tr><th>${t == null ? "None (4 PM)" : pct(t)}</th>${g.stops.map(s => { const c = cell(t, s);
+      return `<td data-t="${t}" data-s="${s}" style="background:${color(c.avg)}">${c.avg == null ? "—" : pct(c.avg)}<small>${c.win_rate == null ? "" : "won " + pct(c.win_rate).replace("+", "")}</small></td>`; }).join("")}</tr>`).join("");
+  markGrid();
+}
+function markGrid() {
+  const t = String(TARGETS[+$("#simTarget").value]), s = String(STOPS[+$("#simStop").value]);
+  document.querySelectorAll("#gridTable td").forEach(td => td.classList.toggle("sel", td.dataset.t === t && td.dataset.s === s));
+}
+$("#gridTable").addEventListener("click", e => {
+  const td = e.target.closest("td"); if (!td) return;
+  const t = td.dataset.t === "null" ? null : +td.dataset.t, s = td.dataset.s === "null" ? null : +td.dataset.s;
+  $("#simTarget").value = TARGETS.findIndex(x => x === t);
+  $("#simStop").value = STOPS.findIndex(x => x === s);
+  runSim(false);
+});
+
+// ---------- contest ----------
+const TRADER = { hermes: ["🦉", "#a371f7"], qwen: ["🐉", "#58a6ff"], model: ["🧠", "#3fb950"], all: ["🐋", "#8b949e"] };
+let contestU = "core", contestWho = "hermes", contestData = null;
+const dollars = v => (v < 0 ? "−$" : "$") + Math.abs(v).toLocaleString(undefined, { maximumFractionDigits: 0 });
+async function loadContest() {
+  try {
+    const C = contestData = await api("contest", { universe: contestU });
+    const r = C.rules;
+    $("#contestRules").innerHTML = `<b>Same rules for everyone:</b> start with ${dollars(r.cash)} · put ${Math.round(r.size * 100)}% of the account in each trade
+      (if the cash is free) · buy at the <span class="term" data-tip="ask">ask</span> right after the whale's trade · sell at
+      ${pct(r.target)} or ${pct(r.stop)}, otherwise at the 4 PM <span class="term" data-tip="bid">bid</span> · $${r.fee.toFixed(2)} per contract fees each way.
+      <span class="muted">Fractional contracts are allowed, so expensive options still count. Updated every night after the close.</span>`;
+    const ranked = [...C.traders].sort((a, b) => b.final - a.final);
+    const medal = ["🥇", "🥈", "🥉", ""];
+    $("#contestBoard").innerHTML = ranked.map((x, i) => `
+      <div class="stat" style="${x.key === "all" ? "opacity:.75" : ""}">
+        <div class="label">${medal[i]} ${TRADER[x.key][0]} <b style="color:${TRADER[x.key][1]}">${esc(x.name)}</b></div>
+        <div class="value ${tone(x.ret)}">${dollars(x.final)}</div>
+        <div class="sub"><b class="${tone(x.ret)}">${pct(x.ret)}</b> · ${x.trades} trades · won ${x.wins}${x.trades ? ` (${Math.round(x.wins / x.trades * 100)}%)` : ""}</div>
+        <div class="sub">Biggest drop: ${pct(x.max_dd)}${x.skipped ? ` · ${x.skipped} skipped (no free cash)` : ""}</div>
+        <div class="sub muted">${esc(x.about)}</div>
+      </div>`).join("");
+    draw("contestChart", { type: "line", data: { labels: ["Start", ...C.days.map(dayShort)],
+      datasets: C.traders.map(x => ({ label: `${TRADER[x.key][0]} ${x.name}`, data: [r.cash, ...x.curve], borderColor: TRADER[x.key][1],
+        backgroundColor: TRADER[x.key][1], borderDash: x.key === "all" ? [5, 4] : [], tension: .2 })) },
+      options: { scales: { y: { ticks: { callback: v => "$" + v.toLocaleString() } } },
+        plugins: { tooltip: { callbacks: { label: c => `${c.dataset.label}: ${dollars(c.raw)}` } } } } });
+    $("#contestWho").innerHTML = C.traders.map(x => `<button data-who="${x.key}" class="${x.key === contestWho ? "active" : ""}">${TRADER[x.key][0]} ${esc(x.name)}</button>`).join("");
+    renderContestTrades();
+  } catch (e) {
+    $("#contestBoard").innerHTML = `<div class="error">Couldn't load the contest: ${esc(e.message)}</div>`;
+  }
+}
+function renderContestTrades() {
+  const x = contestData.traders.find(t => t.key === contestWho);
+  const why = { target: "Took profit", stop: "Stopped out", close: "Sold at 4 PM" };
+  $("#contestTrades").innerHTML = `<tr><th>When</th><th>Contract</th><th class="num">Paid</th><th class="num">Put in</th>
+    <th class="num">Result</th><th class="num">Profit</th><th>How it ended</th></tr>` +
+    (x.log.length ? x.log.map(t => `<tr class="click" data-id="${t.id}"><td>${dayShort(t.start)} ${clock(t.start)}</td><td>${esc(t.contract)}</td>
+      <td class="num">${money(t.entry)}</td><td class="num">${dollars(t.stake)}</td><td class="num ${tone(t.ret)}">${pct(t.ret)}</td>
+      <td class="num ${tone(t.pnl)}">${t.pnl >= 0 ? "+" : ""}${dollars(t.pnl)}</td><td>${why[t.why] || ""}</td></tr>`).join("")
+      : `<tr><td colspan="7" class="muted">No trades yet.</td></tr>`);
+}
+$("#contestUniverse").addEventListener("click", e => {
+  const b = e.target.closest("button"); if (!b) return;
+  contestU = b.dataset.u;
+  document.querySelectorAll("#contestUniverse button").forEach(x => x.classList.toggle("active", x === b));
+  loadContest();
+});
+$("#contestWho").addEventListener("click", e => {
+  const b = e.target.closest("button"); if (!b) return;
+  contestWho = b.dataset.who;
+  document.querySelectorAll("#contestWho button").forEach(x => x.classList.toggle("active", x === b));
+  renderContestTrades();
+});
+$("#contestTrades").addEventListener("click", e => {
+  const row = e.target.closest("tr[data-id]"); if (row) openDetail(row.dataset.id);
+});
+
+// ---------- predictions ----------
+let predScope = "mine";
+async function loadPredictions() {
+  try {
+    const P = await api("predictions", { scope: predScope });
+    $("#scorecard").innerHTML = P.scorecard.map(s => `
+      <div class="stat"><div class="label">${esc(s.name)}</div>
+        <div class="value">${s.rank != null ? s.rank.toFixed(2) : "—"} <span class="muted" style="font-size:13px;font-weight:400" data-tip="rank">rank agreement</span></div>
+        <div class="sub">Its top ${s.n_top} picks: <b class="${s.top_hit > P.base_hit ? "up" : ""}">${pct(s.top_hit).replace("+", "")} won</b> (all picks: ${pct(P.base_hit).replace("+", "")})</div>
+        <div class="sub">Average guess ${pct(s.avg_guess)} · reality ${pct(s.avg_real)}</div></div>`).join("");
+    draw("calibChart", { data: { labels: P.calibration.map(c => c.label), datasets: [
+      { type: "bar", label: "Became winners", data: P.calibration.map(c => c.hit), backgroundColor: P.calibration.map(c => c.hit > P.base_hit ? "#3fb950" : "#4b5563") },
+      { type: "line", label: "All picks", data: P.calibration.map(() => P.base_hit), borderColor: "#d29922", borderDash: [5, 4], pointRadius: 0 },
+    ] }, options: { scales: { y: pctAxis({ min: 0 }), x: { title: { display: true, text: "the model's guess" } } },
+      plugins: { tooltip: { callbacks: { label: c => c.datasetIndex ? `All picks: ${pct(c.raw).replace("+", "")} won`
+        : `${pct(c.raw).replace("+", "")} won (${P.calibration[c.dataIndex].n} picks)` } } } } });
+    draw("scatterChart", { type: "scatter", data: { datasets: [{ data: P.scatter.map(([x, y]) => ({ x, y })), pointRadius: 2.5,
+      backgroundColor: P.scatter.map(([, y]) => y >= 0.3 ? "rgba(63,185,80,.7)" : "rgba(139,148,158,.5)") }] },
+      options: { plugins: { legend: { display: false }, tooltip: { callbacks: { label: c => `guess ${pct(c.raw.x)} → real ${pct(c.raw.y)}` } } },
+        scales: { x: pctAxis({ title: { display: true, text: "model's guess" } }), y: pctAxis({ title: { display: true, text: "best bid after the trade" } }) } } });
+    const sideTxt = r => r.side ? ({ buy: '<span class="chip hit">bought</span>', sell: '<span class="chip hit neg">sold</span>', mid: '<span class="chip">mid</span>' }[r.side]
+      + (r.structure ? ` <span class="chip ${r.our_leg === "sold" ? "hit neg" : ""}">🧩 ${esc(r.structure)}</span>` : "")) : '<span class="muted">—</span>';
+    $("#predTable").innerHTML = `<tr><th>When</th><th>Contract</th><th data-tip="side">Whale</th><th class="num" data-tip="model">Model</th>
+      <th class="num" data-tip="judges">Hermes</th><th class="num" data-tip="judges">Qwen</th><th class="num" data-tip="best">Real best</th><th>Result</th></tr>` +
+      P.recent.map(r => { const m = r.replay ?? r.pred_max_gain;
+        const res = r.real == null ? '<span class="muted">pending</span>' : r.real >= 0.3 ? "✅ winner" : '<span class="muted">no</span>';
+        return `<tr class="click" data-id="${r.id}"><td>${dayShort(r.trade_date)} ${clock(r.trade_date + " " + r.trade_time_et)}</td>
+          <td>${esc(r.ticker)} ${strike(r.strike)} ${pcWord(r.put_call)} ${esc(r.expiration.slice(5))}${r.pinged ? " 🔔" : ""}</td>
+          <td>${sideTxt(r)}</td><td class="num">${pct(m)}</td><td class="num">${pct(r.hermes)}</td><td class="num">${pct(r.qwen)}</td>
+          <td class="num ${tone(r.real)}">${pct(r.real)}</td><td>${res}</td></tr>`; }).join("");
+  } catch (e) {
+    $("#scorecard").innerHTML = `<div class="error">Couldn't load: ${esc(e.message)}</div>`;
+  }
+}
+$("#predScope").addEventListener("click", e => {
+  const b = e.target.closest("button"); if (!b) return;
+  predScope = b.dataset.scope;
+  document.querySelectorAll("#predScope button").forEach(x => x.classList.toggle("active", x === b));
+  loadPredictions();
+});
+["#predTable", "#simTrades"].forEach(sel => $(sel).addEventListener("click", e => {
+  const row = e.target.closest("tr[data-id]"); if (!row) return;
+  openDetail(row.dataset.id);
+}));
+
 // ---------- help ----------
 function renderHelp() {
   $("#help").innerHTML = `
@@ -370,11 +619,15 @@ function renderHelp() {
 }
 
 // ---------- navigation ----------
+const LOADERS = { live: () => loadList(), learning: () => loadLearning(), predictions: () => loadPredictions(),
+  contest: () => loadContest() };
+
 function showView(view) {
+  if (view === "detail" && state.view !== "detail") state.prevView = state.view;
   state.view = view;
   document.querySelectorAll(".view").forEach(v => v.classList.add("hidden"));
   $(`#view-${view}`).classList.remove("hidden");
-  const tab = view === "detail" ? "live" : view;
+  const tab = view === "detail" ? (state.prevView || "live") : view;
   document.querySelectorAll("#tabs button").forEach(b => b.classList.toggle("active", b.dataset.tab === tab));
   if (view !== "detail" && state.chart) { state.chart.remove(); state.chart = null; state.lastDetail = null; }
   window.scrollTo(0, 0);
@@ -383,7 +636,7 @@ function showView(view) {
 $("#tabs").addEventListener("click", e => {
   const b = e.target.closest("button"); if (!b) return;
   showView(b.dataset.tab);
-  if (b.dataset.tab === "live") loadList();
+  (LOADERS[b.dataset.tab] || (() => {}))();
 });
 $("#scope").addEventListener("click", e => {
   const b = e.target.closest("button"); if (!b) return;
@@ -391,18 +644,28 @@ $("#scope").addEventListener("click", e => {
   document.querySelectorAll("#scope button").forEach(x => x.classList.toggle("active", x === b));
   loadList();
 });
-function openCard(e) {
-  const card = e.target.closest(".card"); if (!card) return;
-  if (e.type === "keydown" && e.key !== "Enter") return;
-  state.detailId = card.dataset.id;
+function openDetail(id) {
+  state.detailId = id;
   showView("detail");
+  $("#back").textContent = { learning: "← Back to Learning", predictions: "← Back to Predictions",
+    contest: "← Back to the Contest" }[state.prevView] || "← Back to all pings";
   $("#detail").innerHTML = '<p class="muted">Loading…</p>';
   loadDetail();
 }
+function openCard(e) {
+  const card = e.target.closest(".card"); if (!card) return;
+  if (e.type === "keydown" && e.key !== "Enter") return;
+  openDetail(card.dataset.id);
+}
+function goBack() {
+  const to = state.prevView || "live";
+  showView(to);
+  if (to === "live") loadList();   // the others keep their charts and simulator settings
+}
 $("#cards").addEventListener("click", openCard);
 $("#cards").addEventListener("keydown", openCard);
-$("#back").addEventListener("click", () => { showView("live"); loadList(); });
-document.addEventListener("keydown", e => { if (e.key === "Escape" && state.view === "detail") { showView("live"); loadList(); } });
+$("#back").addEventListener("click", goBack);
+document.addEventListener("keydown", e => { if (e.key === "Escape" && state.view === "detail") goBack(); });
 
 // tooltips: data-tip is a glossary key or plain text
 const tip = $("#tooltip");

@@ -100,7 +100,16 @@ pythonw flow_app.py          # opens the app window (the FlowDesk desktop shortc
 py flow_app.py --browser     # serve only, at http://127.0.0.1:8060
 ```
 
-FlowDesk only reads `flow.db`: it never connects to IBKR or Trade Echo and never writes, so it can't disturb the logger, the IBKR tracker or the Discord pings. Phase 1 is the **Live** screen (every pinged contract, P&L from the whale's fill to the live bid, click-through charts with the whale's buy, ping time, alerts and the model's target). **Predictions** (Phase 2) and **Learning** (Phase 3: training and backtests as charts) come next. Market data is shown for personal use only.
+FlowDesk only reads `flow.db`: it never connects to IBKR or Trade Echo and never writes, so it can't disturb the logger, the IBKR tracker or the Discord pings. Market data is shown for personal use only.
+
+| Screen | What it shows |
+|---|---|
+| **Live** | Every pinged contract: P&L from the whale's fill to the live bid, bought/sold and spread badges, click-through charts with the whale's buy, ping time, alerts and the model's target |
+| **Predictions** | Model vs. Hermes vs. Qwen on IBKR outcomes (rank agreement, top-20% hit rate, bias), "when the model says X" calibration from the walk-forward replay, every guess vs. reality, recent picks table |
+| **Contest** | Paper money: Hermes, Qwen and the model each start with $5,000 and trade the picks they chose under identical rules (10% per trade, buy at the ask right after the whale, +30% / -50% / 4 PM exit, $0.65/contract fees), vs. a "follow every whale" baseline. A separate scoreboard - never fed back into the judges' prompts or the model |
+| **Learning** | Training history, the nightly model contest, the day-by-day walk-forward replay, what the model looks at, and an **exit simulator**: choose trades, whale side, entry (whale's fill / ask right after the trade / your ask at the ping), take-profit and stop-loss, replayed on IBKR's minute bids, with a $1,000-per-trade account curve and a take-profit x stop-loss heat map |
+
+`app_data.py` serves the Live screen, `app_research.py` the Learning and Predictions screens (same exit rule as the Simulator bot).
 
 ## Data rules
 

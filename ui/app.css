@@ -124,6 +124,33 @@ main { max-width: 1400px; margin: 0 auto; padding: 20px 24px 48px; }
 .gloss dt { font-weight: 700; }
 .gloss dd { margin: 0; color: #c9d1d9; }
 
+.rules { font-size: 14px; line-height: 1.6; }
+
+/* learning + predictions */
+h2.section { font-size: 18px; margin: 26px 0 12px; }
+.small { font-size: 13px; margin: -4px 0 10px; }
+.grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(520px, 100%), 1fr)); gap: 14px; }
+.chart-wrap { position: relative; height: 280px; }
+.table-wrap { overflow-x: auto; }
+.table { width: 100%; border-collapse: collapse; font-size: 14px; }
+.table th { text-align: left; color: var(--muted); font-weight: 600; padding: 8px 10px; border-bottom: 1px solid var(--border);
+  white-space: nowrap; position: sticky; top: 0; background: var(--panel); }
+.table td { padding: 7px 10px; border-bottom: 1px solid #222a35; white-space: nowrap; }
+.table tr.click { cursor: pointer; }
+.table tr.click:hover td { background: var(--panel-2); }
+.table td.num, .table th.num { text-align: right; }
+.sim-controls { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 14px 18px; margin-bottom: 14px; }
+.sim-controls label { display: flex; flex-direction: column; gap: 6px; font-size: 13px; color: var(--muted); }
+.sim-controls label b { color: var(--text); }
+select { background: var(--panel-2); color: var(--text); border: 1px solid var(--border); border-radius: 8px;
+  padding: 7px 10px; font: inherit; font-size: 14px; }
+input[type=range] { accent-color: var(--blue); width: 100%; }
+.heat { border-collapse: separate; border-spacing: 4px; font-size: 13px; }
+.heat th { color: var(--muted); font-weight: 600; padding: 4px 8px; white-space: nowrap; }
+.heat td { text-align: center; padding: 8px 10px; border-radius: 6px; cursor: pointer; min-width: 74px; font-weight: 600; }
+.heat td.sel { outline: 2px solid var(--blue); }
+.heat td small { display: block; font-weight: 400; color: rgba(230,237,243,.7); font-size: 11px; }
+
 .tooltip { position: fixed; z-index: 50; max-width: 300px; background: #222b38; border: 1px solid var(--border);
   border-radius: 8px; padding: 8px 10px; font-size: 13px; box-shadow: 0 8px 24px rgba(0,0,0,.4); pointer-events: none; }
 .error { color: var(--red); padding: 16px; }
@@ -133,4 +160,5 @@ main { max-width: 1400px; margin: 0 auto; padding: 20px 24px 48px; }
   main { padding: 16px; }
   .health { margin-left: 0; }
   #chart, .no-chart { height: 320px; }
+  .grid2 { grid-template-columns: 1fr; }
 }

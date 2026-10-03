@@ -7,14 +7,16 @@
 <link rel="icon" href="flowdesk.ico">
 <link rel="stylesheet" href="app.css">
 <script src="https://unpkg.com/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
 </head>
 <body>
 <header class="topbar">
   <div class="brand"><span class="logo">◆</span> FlowDesk</div>
   <nav class="tabs" id="tabs">
     <button data-tab="live" class="active">Live</button>
-    <button data-tab="predictions">Predictions <span class="soon">soon</span></button>
-    <button data-tab="learning">Learning <span class="soon">soon</span></button>
+    <button data-tab="predictions">Predictions</button>
+    <button data-tab="contest">Contest</button>
+    <button data-tab="learning">Learning</button>
     <button data-tab="help">Help</button>
   </nav>
   <div class="health" id="health"></div>
@@ -46,21 +48,151 @@
     <div id="detail"></div>
   </section>
 
+  <!-- PREDICTIONS: the model and the AI judges vs. what really happened -->
   <section id="view-predictions" class="view hidden">
-    <div class="coming">
-      <h2>Predictions <span class="soon">Phase 2</span></h2>
-      <p>What the model and the two AI judges (Hermes and Qwen) expected for each contract, next to what really
-        happened, plus a running scorecard of who is right more often.</p>
-      <p class="muted">For now, every contract's page already shows the model's target line and the judges' guesses.</p>
+    <p class="intro">
+      Every night the model and two AI judges (<b>Hermes</b> and <b>Qwen</b>, running on this PC) guess how far each
+      whale's contract will rise after the trade. Here's how those guesses compare with what really happened on
+      IBKR's prices. A <b>winner</b> = the <span class="term" data-tip="bid">bid</span> reached +30% after the trade.
+    </p>
+    <h2 class="section">Who guesses best?</h2>
+    <div class="stats" id="scorecard"></div>
+    <div class="grid2">
+      <div class="panel">
+        <h3>When the model says X, what really happens?</h3>
+        <p class="muted small">Each bar groups picks by the model's guess (made by a model trained only on earlier
+          days) and shows how many really became winners.</p>
+        <div class="chart-wrap"><canvas id="calibChart"></canvas></div>
+      </div>
+      <div class="panel">
+        <h3>Every guess vs. reality</h3>
+        <p class="muted small">Each dot is one pick. Dots up and to the right = the model expected a big move and got
+          one. Real moves above +300% are drawn at +300%.</p>
+        <div class="chart-wrap"><canvas id="scatterChart"></canvas></div>
+      </div>
     </div>
+    <div class="toolbar" style="margin-top:18px">
+      <h2 class="section" style="margin:0">Recent picks</h2>
+      <div class="segmented" id="predScope">
+        <button data-scope="mine" class="active">Your 12 tickers</button>
+        <button data-scope="all">All tickers</button>
+      </div>
+    </div>
+    <div class="panel table-wrap"><table class="table" id="predTable"></table></div>
   </section>
 
+  <!-- CONTEST: paper money for Hermes, Qwen and the model -->
+  <section id="view-contest" class="view hidden">
+    <p class="intro">
+      <b>Paper-money contest.</b> Hermes, Qwen and the model each got <b>$5,000</b> of pretend money on Sep 23 and trade
+      the picks <i>they</i> chose, under the same rules - so the only difference is how well each one picks.
+      It's a separate scoreboard: nothing here changes how the judges or the model think.
+    </p>
+    <div class="panel rules" id="contestRules"></div>
+    <div class="toolbar" style="margin-top:14px">
+      <div class="segmented" id="contestUniverse">
+        <button data-u="core" class="active">Big noteworthy picks ($350K+)</button>
+        <button data-u="mine">Your 12 tickers</button>
+        <button data-u="all">Everything they judged</button>
+      </div>
+    </div>
+    <div class="stats" id="contestBoard"></div>
+    <div class="panel">
+      <h3>Account value at the end of each day</h3>
+      <div class="chart-wrap"><canvas id="contestChart"></canvas></div>
+    </div>
+    <div class="toolbar" style="margin-top:18px">
+      <h2 class="section" style="margin:0">Trades</h2>
+      <div class="segmented" id="contestWho"></div>
+    </div>
+    <div class="panel table-wrap"><table class="table" id="contestTrades"></table></div>
+  </section>
+
+  <!-- LEARNING: training, backtests, exit simulator -->
   <section id="view-learning" class="view hidden">
-    <div class="coming">
-      <h2>Learning <span class="soon">Phase 3</span></h2>
-      <p>How the models train and get tested, shown as pictures: each night's training run, which model won,
-        a day-by-day replay of predicted vs. real results, and an exit-strategy simulator (for example
-        "take profit at +30%" vs. "hold to the close").</p>
+    <p class="intro">
+      Every night the system <b>grades every pick</b> on real IBKR prices, <b>trains several kinds of models</b>, and
+      tests each one <span class="term" data-tip="walkforward">walk-forward</span> (it predicts each day using only
+      earlier days, like real life). The best one decides tomorrow's pings.
+    </p>
+    <div class="stats" id="learnStats"></div>
+    <div class="grid2">
+      <div class="panel">
+        <h3>Is it getting smarter?</h3>
+        <p class="muted small">Share of the model's picks that became winners vs. all picks, after each night's training.</p>
+        <div class="chart-wrap"><canvas id="historyChart"></canvas></div>
+      </div>
+      <div class="panel">
+        <h3>Tonight's model contest</h3>
+        <p class="muted small"><span class="term" data-tip="rank">Rank agreement</span>: how well each model orders
+          picks from worst to best (0 = random, 1 = perfect). The winner is green.</p>
+        <div class="chart-wrap"><canvas id="boardChart"></canvas></div>
+      </div>
+      <div class="panel">
+        <h3>Backtest replay, day by day</h3>
+        <p class="muted small">Share of winners each day: the model's picks vs. all picks.</p>
+        <div class="chart-wrap"><canvas id="replayChart"></canvas></div>
+      </div>
+      <div class="panel">
+        <h3>What the model looks at</h3>
+        <p class="muted small">How strongly each input lines up with bigger gains (right) or smaller gains (left).
+          Small values are mostly noise.</p>
+        <div class="chart-wrap"><canvas id="inputsChart"></canvas></div>
+      </div>
+    </div>
+
+    <h2 class="section">Exit strategy simulator</h2>
+    <p class="intro">Pick which trades to follow, how you'd get in and when you'd get out. Every trade is replayed
+      minute by minute on IBKR's real bid prices after the whale's trade, the same way the nightly Simulator does.</p>
+    <div class="panel sim-controls">
+      <label>Trades
+        <select id="simGroup">
+          <option value="all">All graded picks</option>
+          <option value="core">Big noteworthy picks ($350K+)</option>
+          <option value="mine">Your 12 tickers</option>
+          <option value="model">Picks the model would ping</option>
+          <option value="pings">Real pings sent to you</option>
+        </select></label>
+      <label>Whale was
+        <select id="simSide">
+          <option value="any">Buying or selling (all)</option>
+          <option value="not_sold">Not selling (what we ping)</option>
+          <option value="buy">Buying at the ask</option>
+          <option value="mid">Mid (unclear)</option>
+          <option value="sell">Selling / sold leg</option>
+          <option value="unknown">Not checked yet</option>
+        </select></label>
+      <label>You buy at
+        <select id="simEntry">
+          <option value="whale">The whale's price</option>
+          <option value="ask_print">The ask right after the whale</option>
+          <option value="ping">Your real ask when the ping arrived</option>
+        </select></label>
+      <label>Take profit at <b id="tgtLabel"></b>
+        <input type="range" id="simTarget" min="0" max="8" step="1" value="2"></label>
+      <label>Stop loss at <b id="stopLabel"></b>
+        <input type="range" id="simStop" min="0" max="4" step="1" value="4"></label>
+    </div>
+    <div class="stats" id="simStats"></div>
+    <div class="grid2">
+      <div class="panel">
+        <h3>Your account if you put $1,000 in every trade</h3>
+        <div class="chart-wrap"><canvas id="equityChart"></canvas></div>
+      </div>
+      <div class="panel">
+        <h3>How trades ended</h3>
+        <div class="chart-wrap"><canvas id="histChart"></canvas></div>
+      </div>
+    </div>
+    <div class="panel" style="margin-top:14px">
+      <h3>Every take-profit × stop-loss combination</h3>
+      <p class="muted small">Average result per trade for the trades and entry chosen above. Green = made money.
+        Click a cell to try it.</p>
+      <div class="table-wrap"><table class="heat" id="gridTable"></table></div>
+    </div>
+    <div class="panel table-wrap" style="margin-top:14px">
+      <h3>The trades</h3>
+      <table class="table" id="simTrades"></table>
     </div>
   </section>
 
