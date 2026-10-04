@@ -47,6 +47,7 @@ const GLOSSARY = {
   orderbook: ["Order book (Level 2)", "Every buy and sell order waiting at each price, not just the best bid and ask. A heavy side shows where big orders are parked. It needs IBKR's Level 2 (depth) data subscriptions."],
   oi: ["Open interest", "How many contracts of this option are open (held by someone). The exchanges publish it once a day, overnight, so it doesn't change during the day. Up vs. the day before = new positions were opened."],
   voloi: ["Volume ÷ open interest", "Contracts traded today divided by the contracts that were open at the start of the day. Above 1 = more traded today than existed - a strong sign of NEW positions being opened, often by the whale."],
+  montage: ["Quotes on each exchange", "The same option trades on about 17 exchanges at once. This shows each exchange's best bid (buyers) and ask (sellers) with how many contracts are waiting there. Lots of size at the best ask = sellers lining up; lots at the best bid = buyers. IBKR's options feed shows 13 exchanges' top quotes; the full queue behind them would need each exchange's paid depth feed."],
   flowlean: ["Whale lean", "Bullish = calls bought or puts sold (they profit if the stock rises). Bearish = puts bought or calls sold. From Trade Echo's trade sentiment, over every trade we logged on the ticker ($25K+, $50K+ on SPY and QQQ, plus the $350K+ whale watch)."],
 };
 
@@ -649,6 +650,7 @@ function renderDetail(d) {
         <span class="muted">Scroll to zoom · drag to move · hover for prices</span>
       </div>
     </div>
+    ${d.state === "expired" ? "" : `<div class="panel table-wrap" id="xbook" style="margin-top:14px">${state.xbookHTML || ""}</div>`}
     <div class="panels">
       <div class="panel story"><h3>What happened</h3>${storyHTML(d)}</div>
       <div class="panel"><h3>What the AI expected</h3>${aiHTML(d)}</div>
@@ -667,6 +669,48 @@ async function loadDetail() {
   } catch (e) {
     $("#detail").innerHTML = `<div class="error">Couldn't load this contract: ${esc(e.message)}</div>`;
   }
+}
+
+// each options exchange's best bid / ask for this contract (IBKR, refreshed every 2 s in market hours)
+function xbookHTML(b) {
+  const title = `<h3><span class="term" data-tip="montage">Quotes on each exchange</span></h3>`;
+  if (!b || b.status !== "ok" || !b.venues.length) {
+    const why = !b ? "" : !b.market_open
+      ? "While the market is open, every options exchange's best bid and ask for this contract appear here, with how many contracts are waiting at each - refreshed every 2 seconds."
+      : b.status === "no_contract" ? "IBKR no longer lists this contract."
+      : b.status === "no_quotes" ? "No exchange is quoting this contract right now."
+      : "Asking IBKR for each exchange's quote…";
+    return `${title}<p class="muted small" style="margin:0">${why}</p>`;
+  }
+  const buy = b.size_at_bid || 0, sell = b.size_at_ask || 0, share = buy + sell ? buy / (buy + sell) : null;
+  const rows = b.venues.map(v => `<tr><td><b>${esc(v.name)}</b></td>
+      <td class="num">${v.bid_size != null ? Number(v.bid_size).toLocaleString() : "—"}</td>
+      <td class="num ${v.bid != null && v.bid === b.best_bid ? "up" : ""}"><b>${money(v.bid)}</b></td>
+      <td class="num ${v.ask != null && v.ask === b.best_ask ? "down" : ""}"><b>${money(v.ask)}</b></td>
+      <td class="num">${v.ask_size != null ? Number(v.ask_size).toLocaleString() : "—"}</td></tr>`).join("");
+  return `${title}
+    <p class="small" style="margin:0 0 8px">${b.venues.length} exchanges quoting. Best bid <b class="up">${money(b.best_bid)}</b> on ${b.n_at_bid} exchange${b.n_at_bid === 1 ? "" : "s"}
+      (${buy.toLocaleString()} contracts waiting to buy) · best ask <b class="down">${money(b.best_ask)}</b> on ${b.n_at_ask} exchange${b.n_at_ask === 1 ? "" : "s"}
+      (${sell.toLocaleString()} waiting to sell).</p>
+    ${share == null ? "" : `<div class="meter"><span style="width:${(share * 100).toFixed(0)}%"></span></div>
+      <div class="meter-label"><span class="up">${Math.round(share * 100)}% of the size at the best prices is buyers</span>
+        <span class="down">${Math.round((1 - share) * 100)}% sellers</span></div>`}
+    <table class="table" style="margin-top:8px"><tr><th>Exchange</th><th class="num">Bid size</th><th class="num">Bid</th>
+      <th class="num">Ask</th><th class="num">Ask size</th></tr>${rows}</table>
+    <p class="muted small" style="margin:8px 0 0">Best price on each exchange only (top of book), from IBKR's options feed.
+      Green / red = the best bid / ask anywhere.</p>`;
+}
+
+async function loadBook() {
+  const id = state.detailId;
+  if (!id) return;
+  try {
+    const b = await api("book", { id });
+    if (state.detailId !== id) return;
+    state.xbookHTML = xbookHTML(b);
+    const el = $("#xbook");
+    if (el) el.innerHTML = state.xbookHTML;
+  } catch (e) { /* keep the last view */ }
 }
 
 // ---------- charts (Chart.js) ----------
@@ -1084,7 +1128,9 @@ function openDetail(id) {
     contest: "← Back to the Contest", lab: "← Back to the Lab", ticker: `← Back to ${state.tTicker}`,
     market: "← Back to the market" }[state.prevView] || "← Back to all pings";
   $("#detail").innerHTML = '<p class="muted">Loading…</p>';
-  loadDetail();
+  state.xbookHTML = "";
+  state.detailAt = Date.now();
+  loadDetail().then(loadBook);
 }
 function openCard(e) {
   const card = e.target.closest(".card"); if (!card) return;
@@ -1156,9 +1202,12 @@ async function heartbeat() {
       if (state.view === "market") await loadMarket();
       else if (state.view === "ticker") await loadTicker();
       else if (state.view === "live") await loadList();
-      else if (state.view === "detail" && state.detailLive && Date.now() - (state.detailAt || 0) >= REFRESH_MS) {
-        state.detailAt = Date.now();
-        await loadDetail();
+      else if (state.view === "detail") {
+        if (state.marketOpen) await loadBook();   // exchange quotes every 2 s; the chart every 15 s
+        if (state.detailLive && Date.now() - (state.detailAt || 0) >= REFRESH_MS) {
+          state.detailAt = Date.now();
+          await loadDetail();
+        }
       }
     }
   } catch (e) { /* each screen shows its own errors */ }

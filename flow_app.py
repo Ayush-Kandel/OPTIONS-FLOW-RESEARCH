@@ -44,6 +44,8 @@ class Handler(SimpleHTTPRequestHandler):
                 data = app_market.ticker(q.get("t"))
             elif name == "focus":
                 data = app_market.focus()
+            elif name == "book":
+                data = app_market.option_book(int(q["id"]))
             elif name == "pings":
                 data = app_data.pings(q.get("scope", "open"))
             elif name == "detail":
