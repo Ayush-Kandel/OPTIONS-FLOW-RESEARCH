@@ -8,7 +8,7 @@ Everything runs on one Windows PC. No cloud AI is used at runtime.
 
 > **Research software, not financial advice.** It never places orders: the IBKR connection is market data only, and account, position and order calls are blocked in code. Nothing has been proven profitable yet (see [Results so far](#results-so-far)).
 
-![FlowDesk - Live](docs/screenshots/live.png)
+![FlowDesk - Market](docs/screenshots/market.png)
 
 ## Contents
 
@@ -32,11 +32,11 @@ Everything runs on one Windows PC. No cloud AI is used at runtime.
 | **Checks each whale** | **Bought or sold?** (Trade Echo's trade sentiment, cross-checked against IBKR's bid/ask that minute) and **spread or hedge?** (other legs printed in the same second with a matching size: verticals, calendars, straddles, collars). It never pings a whale that *sold* - following it would mean betting the other way. |
 | **Decides** | Two local AI judges (Hermes 3 and Qwen 3 via Ollama) and a machine-learning **strategy picker** choose take/skip **and a strategy** for each trade. |
 | **Pings** | Discord: the contract, whale side, the chosen play ("🎯 Play: One-hour hold - model expects +6%"), Greeks, then live follow-ups at +30% / +50% / +100% / -50%. |
-| **Tracks prices** | IBKR (read-only, OPRA): live bid/ask streams from the minute a whale is spotted, 1-minute bars, Greeks, open interest, the companion contracts of big whales for future spread strategies. |
+| **Tracks prices** | IBKR (read-only, OPRA): live bid/ask streams from the minute a whale is spotted, 1-minute bars, Greeks, open interest, the companion contracts of big whales for future spread strategies. Your 12 tickers' stock bars stream as they form for FlowDesk's live Market board. |
 | **Grades honestly** | Every trade on real IBKR bars: buy at the ask right after the whale, sell at the bid, $0.65 per contract each way. |
 | **Learns every night** | Replays every trade under 8 strategies, retrains every model type blind (walk-forward) and promotes whichever *earns* the most per trade. |
 | **Searches nonstop** | The Strategy Lab tests ~300 million home-made strategies per search on spare CPU, trusting only blind and luck tests. |
-| **Shows everything** | FlowDesk: Live, Predictions, Contest, Learning and Lab screens. |
+| **Shows everything** | FlowDesk: a live Market board (refreshing every 2 seconds in market hours), Pings, Predictions, Contest, Learning and Lab screens. |
 | **Watches itself** | 28 data-integrity checks every 30 minutes, a local-AI audit, incident cases investigated by local Qwen, Discord alerts when anything breaks. |
 
 ## How it works
@@ -53,7 +53,8 @@ Everything runs on one Windows PC. No cloud AI is used at runtime.
   -> strategy picker (ML): expected result of each strategy -> best play, or skip
   -> Discord ping (never when the whale sold) + live follow-ups
                  |
-  IBKR TWS (read-only): live bid/ask, 1-minute bars, Greeks, open interest, spread legs
+  IBKR TWS (read-only): live bid/ask, 1-minute bars, Greeks, open interest, spread legs,
+                        your tickers' stock bars as they form (Market board, every few seconds)
                  |
   Nightly: sweep missed picks, add whale-size raw prints as training data, IBKR prices,
            replay every trade under every strategy, walk-forward model contest, reports
@@ -74,19 +75,25 @@ Everything runs on one Windows PC. No cloud AI is used at runtime.
 
 ## FlowDesk (the desktop app)
 
-A local desktop window (desktop shortcut, or `pythonw flow_app.py`) for following everything without reading logs. It only **reads** `flow.db` - it never connects to IBKR or Trade Echo and never writes - so it can't disturb the live system. Hover over any dotted word for a plain-English explanation; the Help tab has the full glossary.
+A local desktop window (desktop shortcut, or `pythonw flow_app.py`) for following everything without reading logs. It only **reads** `flow.db` - it never connects to IBKR or Trade Echo and never writes - so it can't disturb the live system. Hover over any dotted word for a plain-English explanation; the Help tab has the full glossary. During market hours the Market, ticker and Pings screens refresh **every 2 seconds** and numbers flash green/red when they change.
 
 | Screen | What it shows |
 |---|---|
-| **Live** | Every pinged contract still open (or the last session, or all): P&L from the whale's price to the live bid, best-so-far, bought/sold and spread badges, the model's play, alerts. |
+| **Market** (opens first) | A live tile per ticker: price and change, a sparkline against **VWAP**, 1/5/15-minute **momentum**, **volume vs. a normal day** at the same time of day (and whether it's picking up or slowing), RSI, trend, **buyers vs. sellers**, and which way today's **whale flow** leans (bullish vs. bearish dollars). |
+| **Ticker page** | Live 1-minute candles with VWAP, volume and the $250K+ whales marked; momentum, volume and whale-flow panels; the **order book** (when subscribed); every tracked option contract on the ticker with live bid/ask, volume, **open interest**, OI change vs. the day before and **volume ÷ OI**; and the day's whale trades. |
+| **Pings** | Every pinged contract still open (or the last session, or all): P&L from the whale's price to the live bid, best-so-far, bought/sold and spread badges, the model's play, alerts. |
 | **Contract page** | Minute-by-minute bid/ask since the whale, with the whale's buy, when the whale watch saw it, when our ping went out, the alerts, the model's target, and the story of the trade in sentences. |
 | **Predictions** | Model vs. Hermes vs. Qwen on real trade results: rank agreement with profit, what their top picks earned, "when the model says X, what would you have earned", every guess vs. reality, recent picks. |
 | **Contest** | Paper money: Hermes, Qwen and the model each start with **$5,000** and trade the picks - and the strategies - *they* chose under the same rules (10% per trade, buy at the ask right after the whale, $0.65/contract fees), vs. a "follow every whale" baseline. A separate scoreboard: never fed back into the judges or the model. |
 | **Learning** | The strategy playbook (how each way of trading did), nightly training history, the model contest, the day-by-day blind replay, what the model looks at, and an **exit simulator** (pick trades, whale side, entry price, take-profit and stop-loss; replayed on real minute bids; heat map of every combination). |
 | **Lab** | The Strategy Lab's honest status: blind trades, luck test, the strategies it is using, and the best ones in hindsight (labelled "not proof"). |
 
-| Contract page | Predictions |
+**Where the Market board's data comes from.** Stock prices, volume and VWAP come from IBKR's 1-minute bars, which IBKR updates every few seconds while each minute forms (`market_live.py`, inside the IBKR tracker). Option quotes are live OPRA. This account has **no real-time stock quotes for the API** (IBKR answers 2186/10089) and **no Level 2 depth** (2152), so there is no live stock bid/ask, "buyers vs. sellers" is an estimate from where each bar closed in its range, and the order book panel explains what's missing. Add those IBKR subscriptions and the tracker switches to live quotes, exact buying vs. selling from every trade at the bid or ask, and the order book of the ticker open in FlowDesk - automatically. Open interest is published once a day, so it can't move intraday; volume ÷ OI is the live "new positions" signal.
+
+| Pings | Ticker page |
 |---|---|
+| ![Pings](docs/screenshots/live.png) | ![Ticker page](docs/screenshots/ticker.png) |
+| **Contract page** | **Predictions** |
 | ![Contract page](docs/screenshots/pick.png) | ![Predictions](docs/screenshots/predictions.png) |
 | **Contest** | **Learning** |
 | ![Contest](docs/screenshots/contest.png) | ![Learning](docs/screenshots/learning.png) |
@@ -152,7 +159,8 @@ What we have learned: following every whale loses money; **knowing what to skip*
 | `lab.py` | The Strategy Lab: home-made strategy search with blind and luck tests (`--daemon` runs nonstop) |
 | `trade_context.py` | Was the whale buying or selling? One leg of a spread or collar? (and the backfill) |
 | `ibkr.py` | Read-only IBKR data: 1-minute bars, honest outcomes, live tracker, Greeks, open interest, spread legs |
-| `flow_app.py`, `app_data.py`, `app_research.py`, `ui/` | **FlowDesk** desktop app (read-only) |
+| `market_live.py` | Inside the live tracker: your tickers' forming 1-minute bars, daily bars, and (when subscribed) live stock quotes, trade-by-trade buying vs. selling and the order book, for the Market board |
+| `flow_app.py`, `app_data.py`, `app_market.py`, `app_research.py`, `ui/` | **FlowDesk** desktop app (read-only) |
 | `bots.py` | Discord bots: Simulator, Analyst, Judges report, Scout |
 | `integrity.py` | 28 data-integrity checks + a local Qwen audit whose findings are re-verified by code |
 | `cases.py`, `cases/` | Incident cases: evidence -> local Qwen investigation -> verified write-up + Discord |
@@ -221,3 +229,4 @@ py flow_app.py --browser        # FlowDesk in a browser at http://127.0.0.1:8060
 - **A "no-wait" model** trained on whale-watch trades, to act before Trade Echo's scored list catches up.
 - **Live paper test** of anything the Lab validates, before any real money.
 - **Smarter judges** - an overnight prompt contest on past trades, judged blind.
+- **Market context as model inputs** - volume vs. normal, momentum and VWAP distance at the moment of each whale's print (backfillable from the stored 1-minute bars), then buying vs. selling and order-book imbalance once they've been recorded for a few weeks.

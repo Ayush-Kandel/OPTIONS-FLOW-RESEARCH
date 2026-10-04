@@ -3,7 +3,9 @@
 const $ = (sel, el = document) => el.querySelector(sel);
 const ALERTS = ["+30%", "+50%", "+100%", "-50%"];
 const REFRESH_MS = 15000;
-const state = { view: "live", scope: "open", detailId: null, detailLive: false, chart: null, lastDetail: null };
+const LIVE_MS = 2000;      // Market, ticker and pings screens while the market is open
+const state = { view: "market", scope: "open", detailId: null, detailLive: false, chart: null, lastDetail: null,
+  marketOpen: false, prevPx: {}, tTicker: null, tChart: null, tKey: null, tN: 0, tMarks: 0, tPrev: null, loadedAt: {} };
 
 // Plain-English explanations, shown on hover anywhere a term has data-tip="<key>" and on the Help tab
 const GLOSSARY = {
@@ -35,12 +37,23 @@ const GLOSSARY = {
   side: ["Bought or sold?", "Whether the whale was BUYING (paid the ask) or SELLING (hit the bid). Following only makes sense when the whale bought. From Trade Echo's trade sentiment, cross-checked with IBKR's own bid/ask at that minute."],
   spreadleg: ["Spread leg", "The whale traded another contract in the same second with a matching size: one multi-leg order (a vertical spread, calendar, collar...). Its real bet is the combination, not this contract alone. If this was the leg the whale SOLD, no ping is sent."],
   score: ["Flow score", "Trade Echo's 0-100 rating of how unusual and aggressive the trade was. We only consider trades above 30."],
+  vwap: ["VWAP", "Volume-weighted average price: the average price everyone paid today, weighted by how many shares traded. Price above VWAP = buyers have been winning today; below = sellers. Big traders use it as a fair-value line."],
+  volume: ["Volume vs. normal", "Shares traded so far today compared with a normal day at the same time of day (the last 20 days). 2.0× = twice the usual activity - something is going on. Volume is naturally high at the open and close, which this already accounts for."],
+  voltrend: ["Volume picking up / slowing", "The last 5 minutes' trading pace vs. the 15 minutes before, adjusted for the time of day. Picking up = more traders are jumping in right now."],
+  momentum: ["Momentum", "How far the price moved over the last 1, 5, 15 and 30 minutes. Several green moves in a row = strong upward momentum."],
+  rsi: ["RSI", "Relative Strength Index (14 one-minute bars), 0-100. Above 70 = the price ran up fast and may be stretched; below 30 = it dropped fast. It is not a buy/sell signal by itself."],
+  trend: ["Trend", "Uptrend = the 9-minute average is above the 21-minute average AND the price is above VWAP. Downtrend = both below. Mixed = they disagree."],
+  pressure: ["Buyers vs. sellers", "Share of the last 15 minutes' volume that was buying. With live trade data: trades at the ask (buyers paying up) vs. at the bid (sellers hitting). Without it (your account today): an estimate from where each 1-minute bar closed within its range - closing near the high means buyers were in control."],
+  orderbook: ["Order book (Level 2)", "Every buy and sell order waiting at each price, not just the best bid and ask. A heavy side shows where big orders are parked. It needs IBKR's Level 2 (depth) data subscriptions."],
+  oi: ["Open interest", "How many contracts of this option are open (held by someone). The exchanges publish it once a day, overnight, so it doesn't change during the day. Up vs. the day before = new positions were opened."],
+  voloi: ["Volume ÷ open interest", "Contracts traded today divided by the contracts that were open at the start of the day. Above 1 = more traded today than existed - a strong sign of NEW positions being opened, often by the whale."],
+  flowlean: ["Whale lean", "Bullish = calls bought or puts sold (they profit if the stock rises). Bearish = puts bought or calls sold. From Trade Echo's trade sentiment, over every trade we logged on the ticker ($25K+, $50K+ on SPY and QQQ, plus the $350K+ whale watch)."],
 };
 
 // ---------- formatting ----------
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const money = v => v == null ? "—" : "$" + Number(v).toFixed(2);
-const bigMoney = v => v == null ? "—" : v >= 1e6 ? `$${(v / 1e6).toFixed(1)}M` : `$${Math.round(v / 1e3)}K`;
+const bigMoney = v => v == null ? "—" : !v ? "$0" : v >= 1e6 ? `$${(v / 1e6).toFixed(1)}M` : `$${Math.round(v / 1e3)}K`;
 const pct = v => v == null ? "—" : (v >= 0 ? "+" : "−") + Math.abs(v * 100).toFixed(0) + "%";
 const tone = v => v == null ? "" : v >= 0 ? "up" : "down";
 const strike = v => "$" + Number(v).toString();
@@ -75,6 +88,7 @@ async function api(endpoint, params = {}) {
 async function loadHealth() {
   try {
     const s = await api("status");
+    state.marketOpen = s.market_open;
     const ib = s.ibkr.ok ? "ok" : s.ibkr.idle ? "idle" : "bad";
     $("#health").innerHTML = `
       <span data-tip="US options trade 9:30 AM - 4:00 PM Eastern, Monday to Friday.">
@@ -161,6 +175,301 @@ async function loadList() {
   } catch (e) {
     $("#cards").innerHTML = `<div class="error">Couldn't load pings: ${esc(e.message)}</div>`;
   }
+}
+
+// ---------- market board ----------
+const px = v => v == null ? "—" : "$" + Number(v).toFixed(2);
+const pct2 = v => v == null ? "—" : (v >= 0 ? "+" : "−") + Math.abs(v * 100).toFixed(2) + "%";
+const vol = v => v == null ? "—" : v >= 1e9 ? (v / 1e9).toFixed(2) + "B" : v >= 1e6 ? (v / 1e6).toFixed(1) + "M"
+  : v >= 1e3 ? Math.round(v / 1e3) + "K" : String(Math.round(v));
+const arrow = v => v == null ? "" : v > 0 ? "▲" : v < 0 ? "▼" : "";
+const flashCls = (prev, now) => prev == null || now == null || prev === now ? "" : now > prev ? "flash-up" : "flash-down";
+const TREND = { up: ["up", "Uptrend"], down: ["down", "Downtrend"], mixed: ["", "Mixed"] };
+
+function rsiText(r) {
+  if (r == null) return "—";
+  return Math.round(r) + (r >= 70 ? " · stretched up" : r <= 30 ? " · stretched down" : "");
+}
+function volTrendText(v) {
+  if (v == null) return "";
+  return v >= 1.25 ? '<span class="up">↑ picking up</span>' : v <= 0.8 ? '<span class="down">↓ slowing</span>' : "→ steady";
+}
+function stateTag(s) {
+  return {
+    live: '<span class="state live"><span class="dot"></span>LIVE</span>',
+    delayed: '<span class="state" data-tip="IBKR\'s live bar updates aren\'t arriving, so this ticker refreshes every 5 minutes.">Every 5 min</span>',
+    stale: '<span class="state down" data-tip="No new prices from IBKR for a while - is TWS running?">No new prices</span>',
+    closed: '<span class="state">Closed</span>',
+  }[s.state] || "";
+}
+function pressureMeter(p, short) {
+  const v = p && p.buy_share;
+  if (v == null) return `<div class="meter empty"></div><div class="meter-label"><span>Buyers vs sellers: not enough data yet</span></div>`;
+  const est = p.method === "estimate" ? " (estimate)" : "";
+  const bar = `<div class="meter" data-tip="pressure"><span style="width:${(v * 100).toFixed(0)}%"></span></div>`;
+  const buy = `<span class="${v >= 0.5 ? "up" : ""}">${Math.round(v * 100)}% buying</span>`;
+  const sell = `<span class="${v < 0.5 ? "down" : ""}">${Math.round((1 - v) * 100)}% selling</span>`;
+  if (short) return `${bar}<div class="meter-label" data-tip="pressure">${buy}<span>last 15 min${est}</span>${sell}</div>`;
+  return `${bar}<div class="meter-label" data-tip="pressure">${buy}${sell}</div>
+    <div class="muted small" style="margin-top:4px">Last 15 minutes${est}${p.day_share != null ? ` · whole day: ${Math.round(p.day_share * 100)}% buying` : ""}</div>`;
+}
+function flowMeter(f) {
+  if (!f || !(f.bull + f.bear)) return `<div class="meter empty"></div><div class="meter-label" data-tip="flowlean"><span>Whales: no bullish/bearish trades logged ${f && f.n ? "(only unclear ones)" : "yet"}</span></div>`;
+  const share = f.bull / (f.bull + f.bear);
+  return `<div class="meter flow" data-tip="flowlean"><span style="width:${(share * 100).toFixed(0)}%"></span></div>
+    <div class="meter-label" data-tip="flowlean"><span class="up">Whales ${bigMoney(f.bull)} bullish</span>
+      <span>${f.n} trades</span><span class="down">${bigMoney(f.bear)} bearish</span></div>`;
+}
+
+function tileHTML(s) {
+  if (s.state === "no_data") return `<article class="tile" data-t="${esc(s.ticker)}"><div class="t-top"><span class="ticker">${esc(s.ticker)}</span></div>
+    <div class="muted small">No IBKR prices saved for this ticker yet - they start at the next market open.</div></article>`;
+  const prev = state.prevPx[s.ticker];
+  const m = s.mom || {};
+  const chip = (label, v) => `<span class="mchip ${tone(v)}">${label} ${arrow(v)}${v == null ? "—" : Math.abs(v * 100).toFixed(2) + "%"}</span>`;
+  const tr = TREND[s.trend];
+  return `<article class="tile" data-t="${esc(s.ticker)}" tabindex="0">
+    <div class="t-top"><span class="ticker">${esc(s.ticker)}</span>
+      ${tr ? `<span class="chip ${tr[0] === "up" ? "hit" : tr[0] === "down" ? "hit neg" : ""}" data-tip="trend">${tr[1]}</span>` : ""}
+      ${stateTag(s)}</div>
+    <div class="t-price"><span class="px ${flashCls(prev, s.price)}">${px(s.price)}</span>
+      <span class="chg ${tone(s.change)}">${pct2(s.change)}${s.change_abs != null ? ` (${s.change_abs >= 0 ? "+" : "−"}$${Math.abs(s.change_abs).toFixed(2)})` : ""}</span></div>
+    ${spark(s.spark || [], s.vwap ?? (s.spark || [0])[0], (s.vs_vwap ?? 0) >= 0)}
+    <div class="t-row"><span data-tip="vwap">vs. VWAP ${px(s.vwap)}</span><b class="${tone(s.vs_vwap)}">${pct2(s.vs_vwap)}</b></div>
+    <div class="mom" data-tip="momentum">${chip("1m", m["1m"])}${chip("5m", m["5m"])}${chip("15m", m["15m"])}</div>
+    <div class="t-row"><span data-tip="volume">Volume ${vol(s.volume)}${s.rvol != null ? ` · <b>${s.rvol.toFixed(1)}×</b> normal` : ""}</span>
+      <span data-tip="voltrend">${volTrendText(s.vol_trend)}</span></div>
+    <div class="t-row"><span data-tip="rsi">RSI ${rsiText(s.rsi)}</span><span>H ${px(s.high)} · L ${px(s.low)}</span></div>
+    ${pressureMeter(s.pressure, true)}
+    ${flowMeter(s.flow)}
+  </article>`;
+}
+
+function feedNoteHTML(M) {
+  const f = M.feed || {}, parts = [];
+  if (!M.market_open) parts.push(`<b>Market closed</b> - showing ${day(M.session)}'s session. Prices go live at 9:30 AM ET.`);
+  if (f.quotes && f.quotes.status === "not_subscribed")
+    parts.push("Prices come from IBKR's 1-minute bars as they form (every few seconds). Your IBKR account has no real-time " +
+      "<b>stock</b> quotes for the API, so there's no live bid/ask for the stock and buying-vs-selling is an estimate - see Help.");
+  else if (M.market_open && !f.bars)
+    parts.push("The IBKR tracker hasn't started the live board yet (it starts a few minutes after the open; TWS must be running).");
+  else if (M.market_open && f.bars && f.bars.status === "stale")
+    parts.push("IBKR's live bar updates stopped - prices refresh every 5 minutes until they come back.");
+  return parts.join(" ");
+}
+
+async function loadMarket() {
+  try {
+    const M = await api("market");
+    state.marketOpen = M.market_open;
+    $("#feedNote").innerHTML = feedNoteHTML(M);
+    $("#tiles").innerHTML = M.tiles.map(tileHTML).join("");
+    M.tiles.forEach(s => { state.prevPx[s.ticker] = s.price; });
+    $("#mktUpdated").textContent = (M.market_open ? "Live · " : "") + "Updated " + M.now_et + " ET";
+  } catch (e) {
+    $("#tiles").innerHTML = `<div class="error">Couldn't load the market: ${esc(e.message)}</div>`;
+  }
+}
+
+// ---------- one ticker ----------
+function openTicker(t) {
+  state.tTicker = t;
+  if (state.tChart) { state.tChart.remove(); state.tChart = null; }
+  state.tKey = null; state.tPrev = null;
+  showView("ticker");
+  $("#tHead").innerHTML = '<p class="muted">Loading…</p>';
+  ["#tBook", "#tPanels", "#tContracts", "#tWhales"].forEach(s => { $(s).innerHTML = ""; });
+  $("#tName").textContent = t;
+  loadTicker();
+}
+
+async function loadTicker() {
+  try {
+    const d = await api("ticker", { t: state.tTicker });
+    state.marketOpen = d.market_open;
+    renderTicker(d);
+  } catch (e) {
+    $("#tHead").innerHTML = `<div class="error">Couldn't load ${esc(state.tTicker)}: ${esc(e.message)}</div>`;
+  }
+}
+
+function tickerHeadHTML(d) {
+  const p = state.tPrev;
+  const stat = (label, value, sub, tip, cls = "") => `<div class="stat"><div class="label"${tip ? ` data-tip="${tip}"` : ""}>${label}</div>
+    <div class="value ${cls}">${value}</div><div class="sub">${sub}</div></div>`;
+  const tr = TREND[d.trend];
+  return `<div class="d-head"><h1>${esc(d.ticker)}</h1>${stateTag(d)}
+      ${tr ? `<span class="chip ${tr[0] === "up" ? "hit" : tr[0] === "down" ? "hit neg" : ""}" data-tip="trend">${tr[1]}</span>` : ""}
+      <span class="muted">${d.market_open ? "" : day(d.session) + " session"}</span></div>
+    <div class="big-row">
+      ${stat("Price", `<span class="px ${flashCls(p, d.price)}">${px(d.price)}</span>`, d.bid != null ? `bid ${px(d.bid)} · ask ${px(d.ask)}` : `open ${px(d.open)}`)}
+      ${stat("Today", pct2(d.change), d.prev_close != null ? `vs. yesterday's close ${px(d.prev_close)}` : "no previous close yet", "", tone(d.change))}
+      ${stat("vs. VWAP", pct2(d.vs_vwap), `VWAP ${px(d.vwap)}`, "vwap", tone(d.vs_vwap))}
+      ${stat("Volume", d.rvol != null ? d.rvol.toFixed(1) + "× normal" : vol(d.volume), `${vol(d.volume)} shares${d.vol_trend != null ? " · " + volTrendText(d.vol_trend) : ""}`, "volume")}
+      ${stat("Day range", `${px(d.low)} – ${px(d.high)}`, `opened at ${px(d.open)}`)}
+    </div>`;
+}
+
+function drawTicker(d) {
+  const el = $("#tChart");
+  const key = d.ticker + d.session;
+  if (!d.bars.length || !window.LightweightCharts) {
+    if (state.tChart) { state.tChart.remove(); state.tChart = null; }
+    el.innerHTML = `<div class="no-chart">${window.LightweightCharts ? "No IBKR prices saved for this ticker yet." : "Chart library didn't load (no internet?)."}</div>`;
+    state.tKey = null;
+    return;
+  }
+  const toBar = b => ({ time: toTime(b[0]), open: b[1], high: b[2], low: b[3], close: b[4] });
+  const toVol = b => ({ time: toTime(b[0]), value: b[5] || 0, color: b[4] >= b[1] ? "rgba(63,185,80,.35)" : "rgba(248,81,73,.35)" });
+  const toVw = x => ({ time: toTime(x[0]), value: x[1] });
+  const times = d.bars.map(b => toTime(b[0]));
+  const snap = hhmm => { const t = toTime(d.session + " " + hhmm.slice(0, 5)); return times.find(x => x >= t) ?? times[times.length - 1]; };
+  const markers = () => d.markers.filter(p => p.lean !== "unclear").map(p => ({
+    time: snap(p.time), position: p.lean === "bull" ? "belowBar" : "aboveBar", color: p.lean === "bull" ? "#3fb950" : "#f85149",
+    shape: p.lean === "bull" ? "arrowUp" : "arrowDown", text: `${bigMoney(p.premium)} ${p.put_call === "CALL" ? "C" : "P"}${Number(p.strike)}`,
+  })).sort((a, b) => a.time - b.time);
+
+  if (state.tChart && state.tKey === key && d.bars.length >= state.tN) {
+    // live: only the forming bar and any new ones change, so the zoom and scroll stay put
+    for (let i = Math.max(0, state.tN - 1); i < d.bars.length; i++) {
+      state.tSeries.c.update(toBar(d.bars[i]));
+      state.tSeries.v.update(toVol(d.bars[i]));
+      if (d.vwap_line[i][1] != null) state.tSeries.w.update(toVw(d.vwap_line[i]));
+    }
+    state.tN = d.bars.length;
+    if (d.markers.length !== state.tMarks) { state.tSeries.c.setMarkers(markers()); state.tMarks = d.markers.length; }
+    return;
+  }
+  if (state.tChart) state.tChart.remove();
+  el.innerHTML = "";
+  const chart = LightweightCharts.createChart(el, {
+    autoSize: true,
+    layout: { background: { type: "solid", color: "transparent" }, textColor: "#c9d1d9", fontFamily: "Segoe UI, system-ui, sans-serif" },
+    grid: { vertLines: { color: "#1f2630" }, horzLines: { color: "#1f2630" } },
+    rightPriceScale: { borderColor: "#2d3540" },
+    timeScale: { borderColor: "#2d3540", timeVisible: true, secondsVisible: false,
+      tickMarkFormatter: t => { const dt = new Date(t * 1000); return `${dt.getUTCHours() % 12 || 12}:${String(dt.getUTCMinutes()).padStart(2, "0")}`; } },
+    localization: { timeFormatter: t => clock(new Date(t * 1000).toISOString().replace("T", " ")) },
+    crosshair: { mode: 0 },
+  });
+  const c = chart.addCandlestickSeries({ upColor: "#3fb950", downColor: "#f85149", borderVisible: false,
+    wickUpColor: "#3fb950", wickDownColor: "#f85149", priceLineVisible: true });
+  c.priceScale().applyOptions({ scaleMargins: { top: 0.06, bottom: 0.24 } });
+  const v = chart.addHistogramSeries({ priceFormat: { type: "volume" }, priceScaleId: "", lastValueVisible: false, priceLineVisible: false });
+  v.priceScale().applyOptions({ scaleMargins: { top: 0.8, bottom: 0 } });
+  const w = chart.addLineSeries({ color: "#d29922", lineWidth: 2, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false });
+  c.setData(d.bars.map(toBar));
+  v.setData(d.bars.map(toVol));
+  w.setData(d.vwap_line.filter(x => x[1] != null).map(toVw));
+  if (d.prev_close != null) c.createPriceLine({ price: d.prev_close, color: "#8b949e", lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: "Prev close" });
+  c.setMarkers(markers());
+  const legend = $("#tLegend");
+  const base = () => `${esc(d.ticker)} ${px(state.tLast)} · <span class="${tone(state.tChange)}">${pct2(state.tChange)}</span>`;
+  chart.subscribeCrosshairMove(p => {
+    const b = p && p.seriesData ? p.seriesData.get(c) : null;
+    const vv = p && p.seriesData ? p.seriesData.get(v) : null;
+    if (!b) { legend.innerHTML = base(); return; }
+    legend.innerHTML = `${clock(new Date(b.time * 1000).toISOString().replace("T", " "))} · O ${px(b.open)} H ${px(b.high)} L ${px(b.low)} C ${px(b.close)}` +
+      (vv ? ` · Vol ${vol(vv.value)}` : "");
+  });
+  state.tChart = chart; state.tSeries = { c, v, w }; state.tKey = key; state.tN = d.bars.length; state.tMarks = d.markers.length;
+  chart.timeScale().fitContent();   // the whole session; scroll to zoom in
+  legend.innerHTML = base();
+}
+
+function bookHTML(d) {
+  const b = d.book || {};
+  if (b.status === "ok" && ((b.bids || []).length || (b.asks || []).length)) {
+    const bids = b.bids.slice(0, 10), asks = b.asks.slice(0, 10);
+    const max = Math.max(1, ...bids.map(x => x[1] || 0), ...asks.map(x => x[1] || 0));
+    const bs = bids.reduce((s, x) => s + (x[1] || 0), 0), as = asks.reduce((s, x) => s + (x[1] || 0), 0);
+    const rows = Array.from({ length: Math.max(bids.length, asks.length) }, (_, i) => {
+      const bi = bids[i], ai = asks[i];
+      return `<div class="lv b" style="--w:${bi ? (bi[1] / max * 100).toFixed(0) : 0}%">${bi ? `<span>${vol(bi[1])}</span><b>${px(bi[0])}</b>` : ""}</div>
+        <div class="lv a" style="--w:${ai ? (ai[1] / max * 100).toFixed(0) : 0}%">${ai ? `<b>${px(ai[0])}</b><span>${vol(ai[1])}</span>` : ""}</div>`;
+    }).join("");
+    return `<h3><span class="term" data-tip="orderbook">Order book</span> <span class="muted small">live</span></h3>
+      <div class="meter"><span style="width:${(bs / (bs + as || 1) * 100).toFixed(0)}%"></span></div>
+      <div class="meter-label"><span class="up">${vol(bs)} waiting to buy</span><span class="down">${vol(as)} waiting to sell</span></div>
+      <div class="book" style="margin-top:10px"><div class="hd">Buyers (size · price)</div><div class="hd">Sellers (price · size)</div>${rows}</div>
+      <h3 style="margin-top:16px">Buyers vs. sellers (trades)</h3>${pressureMeter(d.pressure)}`;
+  }
+  const why = b.status === "not_subscribed"
+    ? "Your IBKR account doesn't have Level 2 (depth) data, so the orders waiting at each price can't be shown yet. Adding NASDAQ TotalView / NYSE OpenBook in IBKR's market-data subscriptions turns this on automatically."
+    : b.status === "waiting" ? "Asking IBKR for the order book…"
+    : d.market_open ? "The order book appears here a few seconds after you open a ticker (needs IBKR Level 2 data)."
+    : "The order book shows the buy and sell orders waiting at each price while the market is open (needs IBKR Level 2 data).";
+  return `<h3><span class="term" data-tip="orderbook">Order book</span></h3><p class="muted small">${why}</p>
+    <h3 style="margin-top:16px"><span class="term" data-tip="pressure">Buyers vs. sellers</span></h3>${pressureMeter(d.pressure)}
+    ${d.bid != null ? `<div class="kv" style="margin-top:12px"><span class="k" data-tip="bid">Bid × size</span><span class="v">${px(d.bid)} × ${vol(d.bid_size)}</span>
+      <span class="k" data-tip="ask">Ask × size</span><span class="v">${px(d.ask)} × ${vol(d.ask_size)}</span></div>` : ""}`;
+}
+
+function tickerPanelsHTML(d) {
+  const m = d.mom || {}, f = d.flow || {};
+  const row = (k, v, cls = "", tip = "") => `<span class="k"${tip ? ` data-tip="${tip}"` : ""}>${k}</span><span class="v ${cls}">${v}</span>`;
+  return `
+    <div class="panel"><h3><span class="term" data-tip="momentum">Momentum</span></h3><div class="kv">
+      ${row("Last 1 minute", pct2(m["1m"]), tone(m["1m"]))}${row("Last 5 minutes", pct2(m["5m"]), tone(m["5m"]))}
+      ${row("Last 15 minutes", pct2(m["15m"]), tone(m["15m"]))}${row("Last 30 minutes", pct2(m["30m"]), tone(m["30m"]))}
+      ${row("RSI (14 min)", rsiText(d.rsi), d.rsi >= 70 ? "up" : d.rsi <= 30 ? "down" : "", "rsi")}
+      ${row("Trend", TREND[d.trend] ? TREND[d.trend][1] : "—", TREND[d.trend] ? TREND[d.trend][0] : "", "trend")}
+    </div></div>
+    <div class="panel"><h3><span class="term" data-tip="volume">Volume</span></h3><div class="kv">
+      ${row("Shares traded today", vol(d.volume))}
+      ${row("A normal full day", vol(d.normal_volume))}
+      ${row("Pace vs. normal (this time of day)", d.rvol != null ? d.rvol.toFixed(2) + "×" : "—", d.rvol >= 1.5 ? "up" : "")}
+      ${row("Last 5 min vs. the 15 before", volTrendText(d.vol_trend) || "—", "", "voltrend")}
+    </div></div>
+    <div class="panel"><h3><span class="term" data-tip="flowlean">Whale flow today</span></h3>${flowMeter(f)}<div class="kv" style="margin-top:10px">
+      ${row("Bullish (calls bought, puts sold)", bigMoney(f.bull), "up")}${row("Bearish (puts bought, calls sold)", bigMoney(f.bear), "down")}
+      ${row("Unclear (traded mid)", bigMoney(f.unclear))}${row("Trades logged · $350K+", `${f.n ?? 0} · ${f.big ?? 0}`)}
+      ${row("Last 30 min: bullish / bearish", `<span class="up">${bigMoney(f.recent_bull)}</span> / <span class="down">${bigMoney(f.recent_bear)}</span>`)}
+    </div></div>`;
+}
+
+function contractsHTML(d) {
+  if (!d.contracts.length) return '<tr><td class="muted">No open contracts tracked on this ticker.</td></tr>';
+  const side = c => c.side === "buy" ? '<span class="up">bought</span>' : c.side === "sell" ? '<span class="down">sold</span>' : c.side === "mid" ? "mid" : "";
+  return `<thead><tr><th>Contract</th><th>Whale</th><th class="num">Bid</th><th class="num">Ask</th><th class="num">Volume today</th>
+      <th class="num"><span class="term" data-tip="oi">Open interest</span></th><th class="num">vs. day before</th>
+      <th class="num"><span class="term" data-tip="voloi">Vol ÷ OI</span></th><th class="num" data-tip="iv">IV</th></tr></thead><tbody>` +
+    d.contracts.map(c => `<tr class="click" data-id="${c.pick_id}">
+      <td>${c.live ? '<span class="dot ok"></span>' : ""}<b>${strike(c.strike)} ${pcWord(c.put_call)}</b> <span class="muted">${day(c.expiration)}</span></td>
+      <td>${c.pinged ? "🔔 " : ""}${side(c)} ${bigMoney(c.premium)}${c.n > 1 ? ` <span class="muted">×${c.n}</span>` : ""}</td>
+      <td class="num">${money(c.bid)}</td><td class="num">${money(c.ask)}</td>
+      <td class="num">${c.volume != null ? Number(c.volume).toLocaleString() : "—"}</td>
+      <td class="num">${c.oi != null ? Number(c.oi).toLocaleString() : "—"}</td>
+      <td class="num ${tone(c.oi_change)}">${c.oi_change != null ? (c.oi_change >= 0 ? "+" : "−") + Math.abs(c.oi_change).toLocaleString() : "—"}</td>
+      <td class="num ${c.vol_oi >= 1 ? "up" : ""}">${c.vol_oi != null ? c.vol_oi.toFixed(2) : "—"}</td>
+      <td class="num">${c.iv != null ? (c.iv * 100).toFixed(0) + "%" : "—"}</td></tr>`).join("") + "</tbody>";
+}
+
+function whalesHTML(d) {
+  if (!d.prints.length) return '<tr><td class="muted">No whale trades logged on this ticker that day.</td></tr>';
+  const lean = p => p.lean === "bull" ? '<span class="up">Bullish</span>' : p.lean === "bear" ? '<span class="down">Bearish</span>' : '<span class="muted">Unclear</span>';
+  const side = p => ({ buy: "Bought", sell: "Sold", mid: "Mid" })[p.side];
+  return `<thead><tr><th>Time</th><th>Contract</th><th class="num">Size</th><th class="num">Price</th><th class="num">Premium</th>
+      <th data-tip="side">Whale</th><th data-tip="flowlean">Lean</th><th>Type</th></tr></thead><tbody>` +
+    d.prints.map(p => `<tr><td>${clock(d.session + " " + p.time.slice(0, 5))}</td>
+      <td><b>${strike(p.strike)} ${pcWord(p.put_call)}</b> <span class="muted">${day(p.expiration)}</span></td>
+      <td class="num">${Number(p.size).toLocaleString()}</td><td class="num">${money(p.price)}</td>
+      <td class="num"><b>${bigMoney(p.premium)}</b></td><td>${side(p)}</td><td>${lean(p)}</td><td class="muted">${esc(p.activity)}</td></tr>`).join("") + "</tbody>";
+}
+
+function renderTicker(d) {
+  if (d.state === "no_data") {
+    $("#tHead").innerHTML = `<div class="d-head"><h1>${esc(d.ticker)}</h1></div><p class="muted">No IBKR prices saved for this ticker yet - they start at the next market open.</p>`;
+    return;
+  }
+  $("#tHead").innerHTML = tickerHeadHTML(d);
+  state.tPrev = d.price; state.tLast = d.price; state.tChange = d.change;
+  drawTicker(d);
+  $("#tBook").innerHTML = bookHTML(d);
+  $("#tPanels").innerHTML = tickerPanelsHTML(d);
+  $("#tContracts").innerHTML = contractsHTML(d);
+  $("#tWhales").innerHTML = whalesHTML(d);
+  $("#tWhalesTitle").textContent = `Whale trades on ${d.ticker} ${d.market_open ? "today" : "on " + day(d.session)} (newest first)`;
 }
 
 // ---------- detail ----------
@@ -691,29 +1000,47 @@ function renderHelp() {
   $("#help").innerHTML = `
     <h2>How to read FlowDesk</h2>
     <ol>
-      <li><b>Live</b> shows every whale trade we pinged you about. Green numbers = in profit, red = losing.</li>
+      <li><b>Market</b> is your live board: each of your tickers with its price, how busy trading is compared with a normal
+        day, momentum, whether buyers or sellers are in control, and which way today's whales are betting. While the market is
+        open everything refreshes every 2 seconds and flashes green or red when it changes. Click a ticker for its live candle
+        chart (with the whales marked), the order book, and every option contract we're tracking on it.</li>
+      <li><b>Pings</b> shows every whale trade we pinged you about. Green numbers = in profit, red = losing.</li>
       <li>Each card measures P&amp;L from the <b>whale's price</b> to the <b>bid</b> - the price you could sell at right now.</li>
       <li>Click a card for its full chart: when the whale bought, when our ping went out, the best moment to sell and the alerts.</li>
       <li>Hover over any dotted word or label to see what it means.</li>
     </ol>
     <p class="muted">FlowDesk only shows data - it never places trades. Prices come from your Interactive Brokers market-data feed;
       nothing here is financial advice.</p>
+    <h2>Where the live data comes from</h2>
+    <ul>
+      <li><b>Option prices</b> (bid/ask on every tracked contract): IBKR's live OPRA feed, which your account has.</li>
+      <li><b>Stock prices, volume, VWAP, momentum</b>: IBKR's 1-minute bars, which IBKR updates every few seconds while each
+        minute forms. Your account has no real-time <i>stock</i> quotes for the API (IBKR answered "requires additional
+        subscription for API"), so there is no live stock bid/ask and <b>buyers vs. sellers is an estimate</b> from the bars.</li>
+      <li><b>Order book</b>: needs IBKR Level 2 depth data (IBKR answered "Need additional market data permissions - Depth:
+        NASDAQ, ARCA, NYSE..."). </li>
+      <li>If you add those subscriptions in IBKR (Client Portal → Settings → Market Data Subscriptions), FlowDesk switches to
+        live quotes, exact buying vs. selling from every trade, and the order book on its own - no update needed.</li>
+      <li><b>Whale flow</b>: the Trade Echo trades the logger already saves - no extra credits.</li>
+    </ul>
     <h2>Glossary</h2>
     <dl class="gloss">${Object.values(GLOSSARY).map(([t, d]) => `<dt>${esc(t)}</dt><dd>${esc(d)}</dd>`).join("")}</dl>`;
 }
 
 // ---------- navigation ----------
-const LOADERS = { live: () => loadList(), learning: () => loadLearning(), predictions: () => loadPredictions(),
-  contest: () => loadContest(), lab: () => loadLab() };
+const LOADERS = { market: () => loadMarket(), live: () => loadList(), learning: () => loadLearning(),
+  predictions: () => loadPredictions(), contest: () => loadContest(), lab: () => loadLab() };
 
 function showView(view) {
   if (view === "detail" && state.view !== "detail") state.prevView = state.view;
   state.view = view;
   document.querySelectorAll(".view").forEach(v => v.classList.add("hidden"));
   $(`#view-${view}`).classList.remove("hidden");
-  const tab = view === "detail" ? (state.prevView || "live") : view;
+  let tab = view === "detail" ? (state.prevView || "live") : view;
+  if (tab === "ticker") tab = "market";
   document.querySelectorAll("#tabs button").forEach(b => b.classList.toggle("active", b.dataset.tab === tab));
   if (view !== "detail" && state.chart) { state.chart.remove(); state.chart = null; state.lastDetail = null; }
+  if (view !== "ticker" && view !== "detail" && state.tChart) { state.tChart.remove(); state.tChart = null; state.tKey = null; }
   window.scrollTo(0, 0);
 }
 
@@ -732,7 +1059,8 @@ function openDetail(id) {
   state.detailId = id;
   showView("detail");
   $("#back").textContent = { learning: "← Back to Learning", predictions: "← Back to Predictions",
-    contest: "← Back to the Contest", lab: "← Back to the Lab" }[state.prevView] || "← Back to all pings";
+    contest: "← Back to the Contest", lab: "← Back to the Lab", ticker: `← Back to ${state.tTicker}`,
+    market: "← Back to the market" }[state.prevView] || "← Back to all pings";
   $("#detail").innerHTML = '<p class="muted">Loading…</p>';
   loadDetail();
 }
@@ -745,11 +1073,29 @@ function goBack() {
   const to = state.prevView || "live";
   showView(to);
   if (to === "live") loadList();   // the others keep their charts and simulator settings
+  else if (to === "ticker") { state.tKey = null; loadTicker(); }
+  else if (to === "market") loadMarket();
 }
 $("#cards").addEventListener("click", openCard);
 $("#cards").addEventListener("keydown", openCard);
 $("#back").addEventListener("click", goBack);
-document.addEventListener("keydown", e => { if (e.key === "Escape" && state.view === "detail") goBack(); });
+function openTile(e) {
+  const tile = e.target.closest(".tile"); if (!tile) return;
+  if (e.type === "keydown" && e.key !== "Enter") return;
+  openTicker(tile.dataset.t);
+}
+$("#tiles").addEventListener("click", openTile);
+$("#tiles").addEventListener("keydown", openTile);
+$("#tBack").addEventListener("click", () => { showView("market"); loadMarket(); });
+$("#tContracts").addEventListener("click", e => {
+  const row = e.target.closest("tr[data-id]"); if (!row) return;
+  openDetail(row.dataset.id);
+});
+document.addEventListener("keydown", e => {
+  if (e.key !== "Escape") return;
+  if (state.view === "detail") goBack();
+  else if (state.view === "ticker") { showView("market"); loadMarket(); }
+});
 
 // tooltips: data-tip is a glossary key or plain text
 const tip = $("#tooltip");
@@ -770,13 +1116,30 @@ document.addEventListener("mousemove", e => {
 // ---------- start ----------
 renderHelp();
 loadHealth();
-// deep links: #lab, #contest, #learning, #predictions, #help or #pick/<id> open that screen directly
+// deep links: #live, #lab, #contest, #learning, #predictions, #help, #ticker/<T> or #pick/<id> open that screen
 const deep = location.hash.slice(1);
 if (deep.startsWith("pick/")) openDetail(deep.slice(5));
+else if (deep.startsWith("ticker/")) openTicker(deep.slice(7).toUpperCase());
 else if (LOADERS[deep] || deep === "help") { showView(deep); (LOADERS[deep] || (() => {}))(); }
-else loadList();
-setInterval(() => {
-  loadHealth();
-  if (state.view === "live") loadList();
-  else if (state.view === "detail" && state.detailLive) loadDetail();
-}, REFRESH_MS);
+else { showView("market"); loadMarket(); }
+
+// refresh: every 2 s on the Market, ticker and pings screens while the market is open, else every 15 s
+let lastHealth = Date.now();
+async function heartbeat() {
+  try {
+    if (Date.now() - lastHealth > REFRESH_MS) { lastHealth = Date.now(); await loadHealth(); }
+    const due = Date.now() - (state.loadedAt[state.view] || 0) >= (state.marketOpen ? LIVE_MS : REFRESH_MS) - 50;
+    if (due) {
+      state.loadedAt[state.view] = Date.now();
+      if (state.view === "market") await loadMarket();
+      else if (state.view === "ticker") await loadTicker();
+      else if (state.view === "live") await loadList();
+      else if (state.view === "detail" && state.detailLive && Date.now() - (state.detailAt || 0) >= REFRESH_MS) {
+        state.detailAt = Date.now();
+        await loadDetail();
+      }
+    }
+  } catch (e) { /* each screen shows its own errors */ }
+  setTimeout(heartbeat, state.marketOpen ? LIVE_MS : REFRESH_MS);
+}
+setTimeout(heartbeat, LIVE_MS);

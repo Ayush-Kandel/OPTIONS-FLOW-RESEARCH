@@ -151,6 +151,52 @@ input[type=range] { accent-color: var(--blue); width: 100%; }
 .heat td.sel { outline: 2px solid var(--blue); }
 .heat td small { display: block; font-weight: 400; color: rgba(230,237,243,.7); font-size: 11px; }
 
+/* market board */
+.feed-note { font-size: 13px; color: var(--muted); background: var(--panel); border: 1px solid var(--border);
+  border-left: 3px solid var(--amber); border-radius: 8px; padding: 8px 12px; margin-bottom: 14px; }
+.feed-note:empty { display: none; }
+.legend-row { display: flex; gap: 14px; align-items: center; }
+.sw { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; }
+.up-bg { background: var(--green); }
+.down-bg { background: var(--red); }
+.tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(290px, 1fr)); gap: 14px; }
+.tile { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px 16px;
+  cursor: pointer; transition: border-color .15s, transform .15s; display: flex; flex-direction: column; gap: 7px;
+  font-variant-numeric: tabular-nums; }
+.tile:hover { border-color: var(--blue); transform: translateY(-2px); }
+.t-top { display: flex; align-items: center; gap: 8px; }
+.t-price { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.px { font-size: 26px; font-weight: 800; letter-spacing: -0.5px; border-radius: 6px; padding: 0 4px; margin-left: -4px; }
+.chg { font-size: 15px; font-weight: 700; border-radius: 6px; padding: 0 4px; }
+.t-row { display: flex; justify-content: space-between; gap: 8px; font-size: 13px; color: var(--muted); }
+.t-row b { color: var(--text); }
+.mom { display: flex; gap: 6px; flex-wrap: wrap; }
+.mchip { font-size: 12px; padding: 2px 7px; border-radius: 6px; background: var(--panel-2); border: 1px solid var(--border); }
+.mchip.up { color: var(--green); border-color: rgba(63,185,80,.35); }
+.mchip.down { color: var(--red); border-color: rgba(248,81,73,.35); }
+.meter { height: 8px; border-radius: 4px; background: var(--red-bg); overflow: hidden; display: flex; }
+.meter > span { background: var(--green); opacity: .85; transition: width .6s ease; }
+.meter.flow { background: rgba(248,81,73,.55); }
+.meter.flow > span { opacity: 1; }
+.meter.empty { background: var(--panel-2); }
+.meter-label { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted); margin-top: -3px; }
+.flash-up { animation: flashUp 1s ease-out; }
+.flash-down { animation: flashDown 1s ease-out; }
+@keyframes flashUp { from { background: rgba(63,185,80,.45); } to { background: transparent; } }
+@keyframes flashDown { from { background: rgba(248,81,73,.45); } to { background: transparent; } }
+
+/* one ticker */
+.ticker-grid { display: grid; grid-template-columns: minmax(0, 1fr) 330px; gap: 14px; }
+#tChart { height: 470px; }
+.book { display: grid; grid-template-columns: 1fr 1fr; gap: 3px 8px; font-size: 13px; font-variant-numeric: tabular-nums; }
+.book .hd { color: var(--muted); font-weight: 600; font-size: 12px; }
+.book .lv { display: flex; justify-content: space-between; padding: 2px 6px; border-radius: 4px; }
+.book .lv.b { background: linear-gradient(to left, var(--green-bg) var(--w), transparent var(--w)); }
+.book .lv.a { background: linear-gradient(to right, var(--red-bg) var(--w), transparent var(--w)); }
+.big-num { font-size: 22px; font-weight: 800; }
+.kv .v.up { color: var(--green); }
+.kv .v.down { color: var(--red); }
+
 .tooltip { position: fixed; z-index: 50; max-width: 300px; background: #222b38; border: 1px solid var(--border);
   border-radius: 8px; padding: 8px 10px; font-size: 13px; box-shadow: 0 8px 24px rgba(0,0,0,.4); pointer-events: none; }
 .error { color: var(--red); padding: 16px; }
@@ -159,6 +205,9 @@ input[type=range] { accent-color: var(--blue); width: 100%; }
   .topbar { padding: 10px 16px; gap: 10px; }
   main { padding: 16px; }
   .health { margin-left: 0; }
-  #chart, .no-chart { height: 320px; }
+  #chart, .no-chart, #tChart { height: 320px; }
   .grid2 { grid-template-columns: 1fr; }
+}
+@media (max-width: 1000px) {
+  .ticker-grid { grid-template-columns: 1fr; }
 }

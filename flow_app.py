@@ -3,12 +3,14 @@
     pythonw flow_app.py            opens the app in its own window (desktop shortcut runs this)
     py flow_app.py --browser       only serves it, at http://127.0.0.1:8060 (for testing)
 
-A tiny local server (this PC only) answers the UI's data requests from app_data.py, which reads
-flow.db read-only. The app never talks to IBKR or Trade Echo and never writes anything, so it can
-run or crash without touching the logger, the IBKR tracker or the Discord pings.
+A tiny local server (this PC only) answers the UI's data requests from app_data.py, app_market.py
+and app_research.py, which read flow.db read-only. The app never talks to IBKR or Trade Echo and
+never writes anything, so it can run or crash without touching the logger, the IBKR tracker or the
+Discord pings. (The tracker asks /api/focus which ticker is on screen, to stream its order book.)
 """
 
 import json
+import os
 import sys
 import threading
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -16,9 +18,10 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import app_data
+import app_market
 import app_research
 
-HOST, PORT = "127.0.0.1", 8060
+HOST, PORT = "127.0.0.1", int(os.environ.get("FLOWDESK_PORT", "8060"))
 UI = Path(__file__).parent / "ui"
 
 
@@ -35,6 +38,12 @@ class Handler(SimpleHTTPRequestHandler):
             name = url.path[5:]
             if name == "status":
                 data = app_data.status()
+            elif name == "market":
+                data = app_market.board()
+            elif name == "ticker":
+                data = app_market.ticker(q.get("t"))
+            elif name == "focus":
+                data = app_market.focus()
             elif name == "pings":
                 data = app_data.pings(q.get("scope", "open"))
             elif name == "detail":
