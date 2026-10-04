@@ -17,6 +17,7 @@ ET = ZoneInfo("America/New_York")
 DB = Path(os.environ.get("FLOW_DB") or Path(__file__).parent / "flow.db")
 ALERT_ORDER = ["+30%", "+50%", "+100%", "-50%"]
 SPARK_POINTS = 80
+LIVE_FRESH_SEC = 20
 
 
 def _db():
@@ -79,6 +80,16 @@ def _path(db, p, kinds=("BID",)):
                            "AND minute_et >= ? AND close > 0",
                            (p["id"], *kinds, *[f"EXP_{k}" for k in kinds], start)):
         out[m] = v
+    # the stream's latest value (the tracker rewrites it every few seconds) as the newest point
+    try:
+        q = db.execute(f"SELECT {col}, at_utc FROM ib_quotes_now WHERE ticker = ? AND strike = ? AND put_call = ? "
+                       f"AND expiration = ? AND {col} > 0", key).fetchone()
+    except sqlite3.OperationalError:   # tracker from before the live board: no such table yet
+        q = None
+    if q and (datetime.now(timezone.utc) - datetime.fromisoformat(q[1])).total_seconds() < LIVE_FRESH_SEC:
+        m = datetime.fromisoformat(q[1]).astimezone(ET).strftime("%Y-%m-%d %H:%M")
+        if m >= start:
+            out[m] = q[0]
     return sorted(out.items())
 
 

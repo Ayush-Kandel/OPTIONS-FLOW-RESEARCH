@@ -23,7 +23,8 @@ ET = ZoneInfo("America/New_York")
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("IBKR_PORT", "7496"))
 CLIENT_ID = 17
-ALLOWED = {"qualifyContracts", "reqHistoricalData", "reqMarketDataType", "reqMktData", "cancelMktData"}
+ALLOWED = {"qualifyContracts", "reqHistoricalData", "cancelHistoricalData", "reqMarketDataType", "reqMktData",
+           "cancelMktData", "reqMktDepth", "cancelMktDepth"}
 HIST_GAP_SEC = 10.5   # IBKR pacing: at most 60 historical requests per 10 minutes
 
 SCHEMA = """
@@ -78,6 +79,12 @@ CREATE TABLE IF NOT EXISTS ib_live_quotes (     -- streamed during market hours,
     minute_et TEXT NOT NULL,
     bid REAL, ask REAL, last REAL, volume REAL, iv REAL, delta REAL, und_price REAL,
     PRIMARY KEY (ticker, strike, put_call, expiration, minute_et)
+);
+CREATE TABLE IF NOT EXISTS ib_quotes_now (      -- the same streams' latest values, rewritten every few
+    ticker TEXT NOT NULL, strike REAL NOT NULL, put_call TEXT NOT NULL, expiration TEXT NOT NULL,   -- seconds
+    at_utc TEXT NOT NULL,                       -- (FlowDesk's live P&L)
+    bid REAL, ask REAL, last REAL, volume REAL, iv REAL, delta REAL,
+    PRIMARY KEY (ticker, strike, put_call, expiration)
 );
 CREATE TABLE IF NOT EXISTS ib_ping_alerts (     -- live Discord follow-ups already sent
     pick_id INTEGER NOT NULL, level TEXT NOT NULL, sent_utc TEXT NOT NULL,
@@ -227,7 +234,9 @@ class IbData:
     def _on_notice(self, req_id, code, msg, contract=None):
         # 354 = not subscribed at all. (10091 "part of the data needs another subscription" is about
         # the underlying stock's feed - the option's own bid/ask still arrive, so it isn't counted.)
-        if code in (354, 10089, 10090):
+        # Stock requests (the Market screen, market_live.py) have their own subscription and are
+        # handled there.
+        if code in (354, 10089, 10090) and getattr(contract, "secType", "") != "STK":
             self.no_subscription = True
         if code == 1100:
             self._link_ok = False
@@ -476,6 +485,8 @@ class LiveQuotes:
     def __init__(self, db, ib, my_tickers):
         self.db, self.ib, self.my = db, ib, set(my_tickers)
         self.streams, self.last_minute = {}, None
+        self.limit = LIVE_STREAM_MAX   # lowered by the lines the Market screen's stock quotes take
+        self.last_snapshot = 0.0
 
     def refresh(self):
         today = datetime.now(ET).date().isoformat()
@@ -485,7 +496,7 @@ class LiveQuotes:
             f"MAX(ticker IN ({marks})) AS mine, MAX(trade_date || trade_time_et) AS latest FROM picks "
             f"WHERE expiration >= ? GROUP BY ticker, strike, put_call, expiration "
             f"ORDER BY pinged DESC, mine DESC, latest DESC LIMIT ?",
-            (*sorted(self.my), today, LIVE_STREAM_MAX)).fetchall()
+            (*sorted(self.my), today, self.limit)).fetchall()
         # whales the whale watch spotted today on your tickers: priced from first sight,
         # before Trade Echo's scored list (and our ping) catch up
         whales = [tuple(r) for r in self.db.execute(
@@ -494,7 +505,7 @@ class LiveQuotes:
             f"GROUP BY 1, 2, 3, 4 ORDER BY MAX(p.trade_time_et) DESC LIMIT ?",
             (today, *sorted(self.my), today, WHALE_STREAM_MAX))]
         ordered = [tuple(r[:4]) for r in picks if r[4]] + whales + [tuple(r[:4]) for r in picks if not r[4]]
-        wanted = list(dict.fromkeys(ordered))[:LIVE_STREAM_MAX]
+        wanted = list(dict.fromkeys(ordered))[:self.limit]
         for key in [k for k in self.streams if k not in wanted]:
             self.ib.call("cancelMktData", self.streams.pop(key)[0])
         new = [k for k in wanted if k not in self.streams]
@@ -524,6 +535,26 @@ class LiveQuotes:
                          _num(t.volume), _num(g.impliedVol) if g else None, _num(g.delta) if g else None,
                          _num(g.undPrice) if g else None))
         self.db.executemany("INSERT OR REPLACE INTO ib_live_quotes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
+        self.db.commit()
+        return len(rows)
+
+    def snapshot(self, every_sec=2):
+        """Every few seconds: each stream's latest values, for FlowDesk's live P&L (the once-a-minute
+        rows above stay the record)."""
+        if time.time() - self.last_snapshot < every_sec:
+            return 0
+        self.last_snapshot = time.time()
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        rows = []
+        for key, (c, t) in self.streams.items():
+            g = t.modelGreeks
+            bid, ask, last = _num(t.bid), _num(t.ask), _num(t.last)
+            if (bid or 0) <= 0 and (ask or 0) <= 0:
+                continue
+            rows.append((*key, now, bid if bid and bid > 0 else None, ask if ask and ask > 0 else None, last,
+                         _num(t.volume), _num(g.impliedVol) if g else None, _num(g.delta) if g else None))
+        self.db.execute("DELETE FROM ib_quotes_now")
+        self.db.executemany("INSERT INTO ib_quotes_now VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
         self.db.commit()
         return len(rows)
 
@@ -874,13 +905,14 @@ def run_live(db, in_session, next_open, my_tickers, log=print):
     newest picks (minute-by-minute Greeks). Runs as its own process so it never slows the logger.
     Read-only market data, like everything in this module."""
     from ib_async import Option, Stock
+    import market_live
     global CLIENT_ID
     CLIENT_ID = LIVE_CLIENT_ID
     ensure_schema(db)
     ib, contracts = None, {}
     busy = {"entries": False}
     oi_day = {"date": None}
-    live = {"quotes": None, "whale_poll": None}
+    live = {"quotes": None, "whale_poll": None, "market": None}
     alerts = {"summary": None}
 
     def entries_hook():
@@ -898,15 +930,26 @@ def run_live(db, in_session, next_open, my_tickers, log=print):
                     live["quotes"].refresh()
                 if live["quotes"].record():   # a new minute was saved -> check follow-ups
                     ping_updates(db, alerts, log)
+                live["quotes"].snapshot()     # FlowDesk's live P&L, every few seconds
         except NotAllowed:
             raise
         except Exception as e:
             log(f"{datetime.now(ET):%H:%M:%S} IBKR entry/live check failed: {type(e).__name__}: {e}")
+        try:
+            if live["market"]:
+                live["market"].snapshot()     # FlowDesk's Market screen
+        except NotAllowed:
+            raise
+        except Exception as e:
+            log(f"{datetime.now(ET):%H:%M:%S} IBKR market board update failed: {type(e).__name__}: {e}")
         finally:
             busy["entries"] = False
 
     def drop_connection():
         nonlocal ib, contracts
+        if live["market"]:
+            live["market"].close()
+            live["market"] = None
         if live["quotes"]:
             live["quotes"].close()
             live["quotes"] = None
@@ -934,12 +977,24 @@ def run_live(db, in_session, next_open, my_tickers, log=print):
                 ib, contracts = IbData(), {}
                 ib.idle_hook = entries_hook
                 live["quotes"] = LiveQuotes(db, ib, my_tickers)
+                try:   # your tickers' live stock quotes take market-data lines first (if subscribed)
+                    live["market"] = market_live.MarketFeed(db, ib, set(my_tickers) | {"SPY"}, log)
+                    live["quotes"].limit = LIVE_STREAM_MAX - live["market"].start()
+                except NotAllowed:
+                    raise
+                except Exception as e:
+                    log(f"{now:%H:%M:%S} IBKR live: market board start failed: {type(e).__name__}: {e}")
+                    live["market"] = None
             entries_hook()
             n_streams = live["quotes"].refresh()   # stream every open pick contract (pinged first)
             if oi_day["date"] != now.date():   # once per session: OI of every listed pick contract
                 snapshot_open_interest(db, ib, log=log)
                 oi_day["date"] = now.date()
             snapshot_open_interest(db, ib, only_today_picks=True, log=log)   # new picks' OI right away
+            if live["market"] and not live["market"].bars:
+                n_bars = live["market"].start_bars()   # ~2-4 min of paced requests, once per connection
+                log(f"{datetime.now(ET):%H:%M:%S} IBKR live: market board streaming {n_bars} tickers' bars "
+                    f"(live quotes: {live['market'].quotes_status or 'off'})")
             marks = ",".join("?" * len(my_tickers))
             picks = db.execute(
                 f"SELECT id, ticker, strike, put_call, expiration FROM picks WHERE trade_date = ? "
@@ -950,7 +1005,8 @@ def run_live(db, in_session, next_open, my_tickers, log=print):
                 if key not in contracts:
                     s = Stock(ticker, "SMART", "USD")
                     contracts[key] = s if ib.call("qualifyContracts", s) and s.conId else None
-                if contracts[key]:
+                # tickers whose bar stream is live already save every completed minute (market_live)
+                if contracts[key] and not (live["market"] and live["market"].live_bars(ticker)):
                     _store_today(db, ib, contracts[key], "TRADES", ticker=ticker)
             points = 0
             for pid, ticker, strike, pc, exp in picks:
@@ -968,11 +1024,11 @@ def run_live(db, in_session, next_open, my_tickers, log=print):
         except Exception as e:
             log(f"{datetime.now(ET):%H:%M:%S} IBKR live: cycle failed: {type(e).__name__}: {e}")
             drop_connection()
-        # until the next cycle, keep checking for new pings every few seconds
+        # until the next cycle, keep checking for new pings (and saving FlowDesk's live values)
         while time.time() - started < LIVE_CYCLE_SEC:
             if ib is not None and ib.data_ok():
                 entries_hook()
-                ib._ib.sleep(3)
+                ib._ib.sleep(1)
             else:
                 time.sleep(3)
 
