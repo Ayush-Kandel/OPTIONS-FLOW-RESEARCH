@@ -29,6 +29,9 @@ from pathlib import Path
 
 import numpy as np
 
+sys.path.insert(0, str(Path(__file__).parent))
+import pipeline  # noqa: E402  (the condition vocabulary includes its MARKET_INPUTS)
+
 DB = Path(os.environ.get("FLOW_DB") or Path(__file__).with_name("flow.db"))
 FEE = 0.65                      # per contract, each way
 OPEN_MIN = 9 * 60 + 30
@@ -157,13 +160,16 @@ def load(db):
 
 NUMERIC = ["log_premium", "log_fill", "otm_pct", "iv", "abs_delta", "theta_pct", "stock_with_30m", "stock_with_day",
            "spy_with_30m", "repeat_30m", "flow_call_share_30m", "score", "iv_vs_stock_iv", "stock_iv_rank_1y",
-           "hermes_est", "qwen_est", "model"]
+           "hermes_est", "qwen_est", "model", *pipeline.MARKET_INPUTS]
 NUMERIC_WORDS = {
     "log_premium": "trade size ($, log)", "log_fill": "option price (log)", "otm_pct": "% out of the money", "iv": "implied volatility",
     "abs_delta": "delta", "theta_pct": "time decay per day", "stock_with_30m": "stock move its way (30 min)",
     "stock_with_day": "stock move its way (day)", "spy_with_30m": "market move its way (30 min)", "repeat_30m": "repeat buys (30 min)",
     "flow_call_share_30m": "call share of recent flow", "score": "Trade Echo score", "iv_vs_stock_iv": "option IV vs stock IV",
-    "stock_iv_rank_1y": "IV rank (1 yr)", "hermes_est": "Hermes' guess", "qwen_est": "Qwen's guess", "model": "model's blind guess"}
+    "stock_iv_rank_1y": "IV rank (1 yr)", "hermes_est": "Hermes' guess", "qwen_est": "Qwen's guess", "model": "model's blind guess",
+    "rvol_at_print": "stock volume vs normal", "vol_pace_5m": "volume picking up (5 min)",
+    "vwap_dist_with": "price vs VWAP its way", "rsi_with": "RSI its way", "range_pos_with": "spot in day's range its way",
+    "flow_lean_30m_with": "other whales agree (30 min)"}
 
 
 def conditions(rows):
@@ -458,12 +464,14 @@ def _now():
 
 
 def _data_key(db):
-    """Changes whenever graded data, the strategy replays or the model's blind guesses change."""
+    """Changes whenever graded data, the strategy replays, the model's blind guesses or the inputs the
+    conditions are built from change."""
     has_sr = db.execute("SELECT 1 FROM sqlite_master WHERE name = 'strategy_results'").fetchone()
     return "|".join(str(x) for x in db.execute(
         "SELECT COUNT(*), MAX(id), "
         + ("(SELECT MAX(computed_utc) FROM strategy_results)" if has_sr else "NULL")
-        + ", (SELECT MAX(version) FROM replay_preds) FROM picks WHERE true_source = 'ibkr'").fetchone())
+        + ", (SELECT MAX(version) FROM replay_preds) FROM picks WHERE true_source = 'ibkr'").fetchone()) \
+        + f"|inputs{len(NUMERIC)}"
 
 
 def strategy_text(names, combo, col):

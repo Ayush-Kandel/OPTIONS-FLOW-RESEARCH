@@ -108,8 +108,10 @@ A local desktop window (desktop shortcut, or `pythonw flow_app.py`) for followin
 4. **The strategy picker** (`picker:` models): one model per strategy predicts its result; each trade gets its best strategy, or is skipped. In the blind replay a strategy's result is only used for training once that trade had **closed** before the day being predicted, and whales that sold are never taken - exactly like live.
 5. **The AI judges** get the playbook, each strategy's results on similar earlier trades, and their own trading record, and choose take/skip plus a strategy. They are not fine-tuned; what changes is the memory in their prompt (earlier days only).
 6. **More data every day.** Whale-size raw prints become training picks every night (never pinged), and `--whale-history` pulls the past week of them.
+7. **The tape around the whale** (`MARKET_INPUTS`, the same math as FlowDesk's Market screen in `tape.py`): stock volume vs. a normal day at that minute, volume picking up or slowing, price vs. VWAP, RSI, spot in the day's range, and whether other whales leaned the same way in the 30 minutes before. All from 1-minute bars that **end before the print** and earlier prints, so they are known at ping time - inputs that would only be known later (the option's own run-up, its volume, size vs. open interest) are left out until the tracker records them at first sight.
+8. **An honest with/without test.** Every night the same blind contest is rerun **without** the market inputs (`input_test`); the Learning screen shows both. First result (Oct 3, 540 graded trades): best method -4.8% per trade with them vs. -6.9% without, but better for only 13 of 23 methods - *no clear difference yet*. Nothing is profitable either way.
 
-Every night: grade the new trades -> replay every strategy -> retrain every model type blind -> promote whichever earns the most per trade.
+Every night: grade the new trades -> replay every strategy -> retrain every model type blind -> promote whichever earns the most per trade -> rerun without the market inputs to check they earn their place.
 
 ## The Strategy Lab
 
@@ -166,6 +168,7 @@ What we have learned: following every whale loses money; **knowing what to skip*
 | `cases.py`, `cases/` | Incident cases: evidence -> local Qwen investigation -> verified write-up + Discord |
 | `dashboard.py` | Operator dashboard at http://localhost:8050 |
 | `greeks.py` | Black-Scholes IV and Greeks (no API calls) |
+| `tape.py` | Stock-tape math shared by the Market screen and the model inputs: normal volume curve, volume vs. normal, RSI, VWAP |
 | `tradeecho_probe.py` | Minimal Trade Echo MCP client |
 | `run_logger.ps1`, `run_ibkr_live.ps1`, `run_lab.ps1` | Restart loops started by Windows Task Scheduler |
 | `reload_logger.ps1`, `setup_webhooks.ps1` | Reload the logger after code changes; save Discord webhooks as environment variables |
@@ -208,6 +211,8 @@ py flow_logger.py               # the 24/7 logger (normally started by Task Sche
 py flow_logger.py --status      # what's running, credits, picks
 py flow_logger.py --check       # data-integrity checks
 py flow_logger.py --train       # nightly model contest now
+py flow_logger.py --input-test  # the same blind contest with vs. without the market inputs
+py flow_logger.py --daily-bars  # IBKR daily bars (normal volume) for every recent pick ticker
 py flow_logger.py --ibkr        # IBKR prices, spreads, spread legs, Greeks
 py flow_logger.py --ibkr-live   # market-hours tracker (live quotes, entries, follow-ups)
 py flow_logger.py --context     # bought/sold + spread-leg backfill (2 credits per pick)
@@ -229,4 +234,4 @@ py flow_app.py --browser        # FlowDesk in a browser at http://127.0.0.1:8060
 - **A "no-wait" model** trained on whale-watch trades, to act before Trade Echo's scored list catches up.
 - **Live paper test** of anything the Lab validates, before any real money.
 - **Smarter judges** - an overnight prompt contest on past trades, judged blind.
-- **Market context as model inputs** - volume vs. normal, momentum and VWAP distance at the moment of each whale's print (backfillable from the stored 1-minute bars), then buying vs. selling and order-book imbalance once they've been recorded for a few weeks.
+- **Option-side inputs at first sight** - the tracker records the contract's run-up, volume and size vs. open interest the moment a whale is spotted, so they can become model inputs without peeking; then buying vs. selling and order-book imbalance once (and if) those feeds are subscribed.

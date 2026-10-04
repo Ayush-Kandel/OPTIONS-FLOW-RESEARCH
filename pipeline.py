@@ -89,7 +89,18 @@ FEATURES = ["score", "log_premium", "log_fill", "dte", "hours_to_expiry", "is_ca
             # stock implied volatility (IBKR, previous close only): level, 1-year rank, and how
             # expensive this contract is vs the stock's normal IV
             "stock_iv_prev", "stock_iv_rank_1y", "iv_vs_stock_iv"]
+# the tape around the whale (tape.py, the same math as FlowDesk's Market screen), from 1-minute stock
+# bars that END before the print minute and Trade Echo prints before it - all known at ping time.
+# "_with" = signed in the trade's direction (positive helps a call bought, or a put bought)
+MARKET_INPUTS = ["rvol_at_print",        # volume so far vs. a normal day by the same minute
+                 "vol_pace_5m",          # last 5 minutes' volume vs. the 15 before (time-of-day adjusted)
+                 "vwap_dist_with",       # price vs. today's VWAP
+                 "rsi_with",             # RSI(14 one-minute bars) - 50, scaled to -1..1
+                 "range_pos_with",       # where the price sits in the day's range so far, -1..1
+                 "flow_lean_30m_with"]   # other whales in the 30 min before: bullish vs. bearish $, -1..1
+FEATURES += MARKET_INPUTS
 CONTEXT_MAX_STALE_MIN = 10       # latest bar must be this close to the print, else no context
+CURVE_DAYS = 45                  # "normal" intraday volume shape: complete days in this window before the trade
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS picks (
@@ -737,7 +748,100 @@ def features_for(db, pick_id):
     f["spy_with_day"] = None if pday is None else sign * pday
     f["stock_iv_prev"], f["stock_iv_rank_1y"] = _stock_iv(db, ticker, trade_date)
     f["iv_vs_stock_iv"] = iv / f["stock_iv_prev"] if iv and f["stock_iv_prev"] else None
+    f.update(_tape_features(db, ticker, trade_date, hhmm, sign))
+    f["flow_lean_30m_with"] = _flow_lean(db, ticker, trade_date, hhmm, sign)
     return f, spot
+
+
+def _tape_features(db, ticker, trade_date, hhmm, sign):
+    """MARKET_INPUTS from the stock's 1-minute bars that end before the print minute (Nones if missing)."""
+    import tape
+    out = dict.fromkeys(MARKET_INPUTS[:-1])
+    try:
+        bars = db.execute("SELECT minute_et, open, high, low, close, volume, vwap FROM ib_stock_bars WHERE ticker = ? "
+                          "AND minute_et >= ? AND minute_et < ? ORDER BY minute_et",
+                          (ticker, f"{trade_date} 09:30", f"{trade_date} {hhmm}")).fetchall()
+    except sqlite3.OperationalError:
+        return out
+    if not bars:
+        return out
+    h, m = (int(x) for x in hhmm.split(":"))
+    lh, lm = (int(x) for x in bars[-1][0][11:].split(":"))
+    if (h * 60 + m) - (lh * 60 + lm) > CONTEXT_MAX_STALE_MIN:
+        return out
+    last = bars[-1][4]
+    vw = tape.vwap(bars)
+    if vw and last:
+        out["vwap_dist_with"] = sign * (last / vw - 1)
+    r = tape.rsi([b[4] for b in bars])
+    if r is not None:
+        out["rsi_with"] = sign * (r - 50) / 50
+    hi, lo = max(b[2] for b in bars), min(b[3] for b in bars)
+    if hi > lo:
+        out["range_pos_with"] = sign * (2 * (last - lo) / (hi - lo) - 1)
+    curve = _volume_curve(db, trade_date)
+    out["rvol_at_print"] = tape.rvol(bars, curve, _normal_volume(db, ticker, trade_date))
+    out["vol_pace_5m"] = tape.volume_pace(bars, curve)
+    return out
+
+
+_curve_cache = {}
+
+
+def _volume_curve(db, trade_date):
+    """Normal intraday volume shape from your tickers' complete days BEFORE `trade_date` (no peeking)."""
+    if trade_date not in _curve_cache:
+        import tape
+        start = (date.fromisoformat(trade_date) - timedelta(days=CURVE_DAYS)).isoformat()
+        mine = sorted(MY_TICKERS)
+        days = {}
+        try:
+            for t, d, hm, v in db.execute(
+                    f"SELECT ticker, substr(minute_et, 1, 10), substr(minute_et, 12, 5), volume FROM ib_stock_bars "
+                    f"WHERE ticker IN ({','.join('?' * len(mine))}) AND minute_et >= ? AND minute_et < ? AND volume > 0",
+                    (*mine, start, trade_date)):
+                if "09:30" <= hm <= "15:59":
+                    days.setdefault((t, d), {})[hm] = v
+        except sqlite3.OperationalError:
+            pass
+        _curve_cache[trade_date] = tape.volume_curve(days.values())
+    return _curve_cache[trade_date]
+
+
+def _normal_volume(db, ticker, trade_date):
+    """A normal full day's volume before `trade_date`: the last 20 IBKR daily bars, else complete days of
+    1-minute bars (3+ needed)."""
+    try:
+        avg, n = db.execute("SELECT AVG(volume), COUNT(*) FROM (SELECT volume FROM ib_stock_daily WHERE ticker = ? "
+                            "AND trade_date < ? ORDER BY trade_date DESC LIMIT 20)", (ticker, trade_date)).fetchone()
+        if n >= 5:
+            return avg
+    except sqlite3.OperationalError:   # no daily bars table yet (market_live.py creates it)
+        pass
+    avg, n = db.execute("SELECT AVG(v), COUNT(*) FROM (SELECT SUM(volume) AS v FROM ib_stock_bars WHERE ticker = ? "
+                        "AND minute_et < ? GROUP BY substr(minute_et, 1, 10) HAVING COUNT(*) >= 380 "
+                        "ORDER BY substr(minute_et, 1, 10) DESC LIMIT 20)", (ticker, trade_date)).fetchone()
+    return avg if n >= 3 else None
+
+
+def _flow_lean(db, ticker, trade_date, hhmm, sign):
+    """Other whales on the ticker in the 30 minutes before this print (strictly earlier minutes):
+    (bullish $ - bearish $) / (bullish $ + bearish $), signed in this trade's direction. Bullish =
+    calls bought or puts sold, from Trade Echo's sentiment. None when there were none."""
+    from trade_context import side_of
+    start = (datetime(2000, 1, 1, *(int(x) for x in hhmm.split(":"))) - timedelta(minutes=30)).strftime("%H:%M:%S")
+    bull = bear = 0.0
+    for pc, sent, prem in db.execute(
+            "SELECT put_call, sentiment, COALESCE(premium, size * fill_price * 100) FROM prints WHERE ticker = ? "
+            "AND trade_date = ? AND trade_time_et >= ? AND trade_time_et < ?", (ticker, trade_date, start, f"{hhmm}:00")):
+        side = side_of(pc, sent)
+        if side == "mid" or not prem:
+            continue
+        if (side == "buy") == (pc == "CALL"):
+            bull += prem
+        else:
+            bear += prem
+    return sign * (bull - bear) / (bull + bear) if bull + bear else None
 
 
 def _stock_iv(db, ticker, trade_date):
@@ -889,16 +993,19 @@ def _score_predictions(kind, pred, gain, profit):
     return out
 
 
-def train(db):
+def train(db, features=None, dry_run=False):
     """Nightly contest: replay past days as if live (train on earlier days only, predict the next).
     Every method competes twice - trained on the spike (the best bid after the print) and trained on
     the real trade result ('profit:' methods) - and ALL are judged on the same thing: the trading
     profit of the trades they would have taken, each with its most profitable 'take when >= X' rule.
-    The winner is refit on all data. Graded only on IBKR-verified picks."""
+    The winner is refit on all data. Graded only on IBKR-verified picks.
+    `features` = the inputs to use (default FEATURES); `dry_run` = only run the blind contest and return
+    its board - nothing is saved (used by input_test to compare input sets)."""
     import joblib
     import numpy as np
 
-    sources = update_true_outcomes(db)
+    cols = list(features or FEATURES)
+    sources = None if dry_run else update_true_outcomes(db)
     rows = db.execute("SELECT id, trade_date, true_gain_pct, hermes_expected_gain, qwen_expected_gain, "
                       "true_source, trade_ret FROM picks WHERE true_gain_pct IS NOT NULL "
                       "AND true_source IN ('ibkr', 'te_confirmed') "
@@ -914,12 +1021,13 @@ def train(db):
     if n < MODEL_MIN_ROWS or graded.sum() < MODEL_MIN_ROWS:
         note = (f"need {MODEL_MIN_ROWS}+ picks with honest after-print prices; have {n} "
                 f"({int(graded.sum())} IBKR-verified)")
-        db.execute("INSERT INTO model_runs (run_utc, status, target, n_rows, base_rate_hit, note) "
-                   "VALUES (?, 'waiting_for_data', ?, ?, ?, ?)", (_utc_iso(), TARGET_NAME, n, base, note))
-        db.commit()
+        if not dry_run:
+            db.execute("INSERT INTO model_runs (run_utc, status, target, n_rows, base_rate_hit, note) "
+                       "VALUES (?, 'waiting_for_data', ?, ?, ?, ?)", (_utc_iso(), TARGET_NAME, n, base, note))
+            db.commit()
         return {"status": "waiting_for_data", "n": n, "base": base, "note": note}
 
-    X = _frame(db, [r[0] for r in rows])
+    X = _frame(db, [r[0] for r in rows], cols)
     y = np.log1p(np.clip(actual, -0.99, None))
     w = np.array([TRUE_WEIGHTS[r[5]] for r in rows])
     llm_all = {"hermes": np.array([np.nan if r[3] is None else r[3] for r in rows], dtype=float),
@@ -1015,6 +1123,10 @@ def train(db):
                                      "spearman": float("nan"), "n": 0, "mae": float("nan"),
                                      "profit_avg": None, "profit_total": None}
     base_profit = float(truth_profit.mean()) if len(truth_profit) else None
+    if dry_run:
+        return {"status": "dry_run", "n": n, "n_graded": int(graded.sum()), "replay_days": len(replay_days),
+                "kind": winner["kind"], "profit_avg": winner.get("profit_avg"), "n_hit": winner["n_pings"],
+                "board": board, "base_profit": base_profit, "features": cols}
 
     kind = winner["kind"]
     strategy_estimators = None
@@ -1034,7 +1146,7 @@ def train(db):
     target_name = "trade_profit" if kind.startswith((PROFIT_PREFIX, PICKER_PREFIX)) else TARGET_NAME
     version = datetime.now().strftime("%Y%m%d-%H%M")
     MODEL_DIR.mkdir(exist_ok=True)
-    bundle = {"kind": kind, "estimator": est, "strategy_estimators": strategy_estimators, "features": FEATURES,
+    bundle = {"kind": kind, "estimator": est, "strategy_estimators": strategy_estimators, "features": cols,
               "version": version, "n": n, "target": target_name, "hermes_fill": float(np.median(actual)),
               "ping_threshold": winner["threshold"], "base_rate_hit": base, "replay": winner,
               "replay_days": replay_days, "leaderboard": board, "sources": sources,
@@ -1063,6 +1175,62 @@ def train(db):
             "mae": winner["mae"], "hit": winner["hit"], "n_hit": winner["n_pings"],
             "threshold": winner["threshold"], "board": board, "profit_avg": winner.get("profit_avg"),
             "profit_total": winner.get("profit_total"), "base_profit": base_profit}
+
+
+INPUT_TESTS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS input_tests (       -- do new inputs help? the same blind contest with and without them
+    id INTEGER PRIMARY KEY, run_utc TEXT NOT NULL, version TEXT,
+    inputs TEXT NOT NULL,                       -- JSON list of the inputs being tested
+    n_graded INTEGER, replay_days INTEGER,
+    rows TEXT NOT NULL,                         -- JSON: per method, blind profit per trade / trades / rank with and without
+    summary TEXT NOT NULL                       -- JSON: winners with and without, methods better / worse
+);
+"""
+
+
+def input_test(db, with_result=None, inputs=None):
+    """Do the market inputs (MARKET_INPUTS) actually help? Reruns tonight's blind contest WITHOUT them
+    (nothing is saved but this comparison) and compares every trained method: blind profit per trade
+    and rank agreement with profit, with vs. without. Judges-only methods don't use inputs and are
+    left out. `with_result` = tonight's train() result (else the contest is rerun with them too)."""
+    inputs = list(inputs or MARKET_INPUTS)
+    if not with_result or not with_result.get("board"):
+        with_result = train(db, dry_run=True)
+    without = train(db, features=[f for f in FEATURES if f not in inputs], dry_run=True)
+    if not with_result.get("board") or not without.get("board"):
+        return None
+    off = {r["kind"]: r for r in without["board"]}
+    rows, better, worse = [], 0, 0
+    for r in with_result["board"]:
+        k = r["kind"]
+        if k in LLM_SOURCES or k not in off:
+            continue
+        a, b = r.get("profit_avg"), off[k].get("profit_avg")
+        rows.append({"kind": k, "with": a, "without": b, "n_with": r.get("n_pings"), "n_without": off[k].get("n_pings"),
+                     "rank_with": r.get("spearman_profit"), "rank_without": off[k].get("spearman_profit")})
+        if a is not None and b is not None:
+            better += a > b + 1e-9
+            worse += a < b - 1e-9
+    rows.sort(key=lambda x: -(x["with"] if x["with"] is not None else -1e9))
+    summary = {"winner_with": with_result.get("kind"), "profit_with": with_result.get("profit_avg"),
+               "winner_without": without.get("kind"), "profit_without": without.get("profit_avg"),
+               "better": better, "worse": worse, "compared": len(rows)}
+    db.executescript(INPUT_TESTS_SCHEMA)
+    db.execute("INSERT INTO input_tests (run_utc, version, inputs, n_graded, replay_days, rows, summary) "
+               "VALUES (?, ?, ?, ?, ?, ?, ?)",
+               (_utc_iso(), with_result.get("version"), json.dumps(inputs), with_result.get("n_graded"),
+                with_result.get("replay_days"), json.dumps(rows), json.dumps(summary)))
+    db.commit()
+    return summary
+
+
+def _describe_input_test(s):
+    if not s:
+        return "input test: not enough data"
+    pct = lambda v: "n/a" if v is None else f"{v:+.1%}"
+    return (f"market inputs: winner {s['winner_with']} {pct(s['profit_with'])}/trade with them vs. "
+            f"{s['winner_without']} {pct(s['profit_without'])} without; better for {s['better']} of "
+            f"{s['compared']} methods, worse for {s['worse']}")
 
 
 _model_cache = {"mtime": None, "bundle": None}
@@ -1670,6 +1838,7 @@ def run_after_close(db, call, trade_date):
         ibkr.price_picks(db)
         ibkr.price_expiries(db)
         ibkr.price_underlyings(db)
+        ibkr.price_daily(db)
         ibkr.price_stock_iv(db)
         ibkr.refresh_greeks(db)
         import trade_context
@@ -1681,6 +1850,10 @@ def run_after_close(db, call, trade_date):
                      bot="auditor")
     result = train(db)
     print(f"Model: {_describe(result)}")
+    try:   # do the market inputs help? (the same blind contest without them; FlowDesk's Learning screen)
+        print(_describe_input_test(input_test(db, result)))
+    except Exception as e:
+        print(f"Input test failed: {type(e).__name__}: {e}")
     db.execute("INSERT OR REPLACE INTO daily_runs (trade_date, finished_utc, summary) VALUES (?, ?, ?)",
                (trade_date, _utc_iso(), json.dumps({"swept_new": found, "prices": counts,
                                                     "model": {k: v for k, v in result.items()

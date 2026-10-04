@@ -1086,6 +1086,40 @@ def price_underlyings(db, deadline=None, log=print):
     return counts
 
 
+def price_daily(db, deadline=None, log=print):
+    """Daily bars for every ticker with picks in the last 30 days (plus SPY) that lacks them up to the
+    day before its latest pick: a normal day's volume for the 'volume vs. normal' model input. 90 days
+    per ticker the first time (~10 s each, IBKR's pacing), then only when a newer pick needs them."""
+    import market_live
+    from ib_async import Stock
+    market_live.ensure_schema(db)
+    since = (datetime.now(ET).date() - timedelta(days=30)).isoformat()
+    no_stock = {t for (t,) in db.execute("SELECT DISTINCT ticker FROM ib_stock_days WHERE status = 'no_contract'")}
+    latest = db.execute("SELECT ticker, MAX(trade_date) FROM picks WHERE trade_date >= ? GROUP BY ticker "
+                        "UNION SELECT 'SPY', MAX(trade_date) FROM picks", (since,)).fetchall()
+    todo = [t for t, d in latest if d and t not in no_stock and t not in INDEX_CLASSES
+            and market_live.needs_daily(db, t, date.fromisoformat(d))]
+    if not todo:
+        log("IBKR: daily bars up to date")
+        return 0
+    if not available():
+        log("IBKR: TWS is not accepting API connections - daily bars skipped")
+        return 0
+    log(f"IBKR: daily bars for {len(todo)} tickers (~{len(todo) * HIST_GAP_SEC / 60:.0f} min)")
+    ib = IbData()
+    try:
+        stocks = {}
+        for t in todo:
+            s = Stock(t, "SMART", "USD")
+            if ib.call("qualifyContracts", s) and s.conId:
+                stocks[t] = s
+        n = market_live.fetch_daily_bars(db, ib, stocks, log=log, deadline=deadline)
+    finally:
+        ib.close()
+    log(f"IBKR: daily bars saved for {n} tickers")
+    return n
+
+
 def _bars(ib, contract, trade_date, kind, with_vwap=False):
     end = datetime.combine(trade_date, datetime.min.time(), ET).replace(hour=16, minute=5)
     bars = ib.call("reqHistoricalData", contract,

@@ -176,6 +176,14 @@
         = how often its blind-tested choices used each one.</p>
       <table class="table" id="strategyTable"></table>
     </div>
+    <div class="panel table-wrap" style="margin-bottom:14px">
+      <h3>Do the market inputs help?</h3>
+      <p class="muted small">The models now also see the tape around each whale: stock volume vs. normal, volume picking up,
+        price vs. VWAP, RSI, spot in the day's range and whether other whales agreed in the 30 minutes before - all known at
+        ping time. Every night the same blind contest is rerun without them; this is the honest comparison (blind profit per
+        trade after fees).</p>
+      <div id="inputTest"></div>
+    </div>
     <div class="grid2">
       <div class="panel">
         <h3>Is it getting smarter?</h3>
