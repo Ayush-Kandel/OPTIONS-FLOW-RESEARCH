@@ -1054,6 +1054,7 @@ def run_ibkr(db):
         ibkr.price_legs(db, deadline=deadline)   # spread legs of big whales, for spread strategies later
         ibkr.price_stock_iv(db, deadline=deadline)
         ibkr.price_underlyings(db, deadline=deadline)
+        ibkr.price_daily(db, deadline=deadline)   # normal daily volume, for the 'volume vs. normal' input
         ibkr.refresh_greeks(db)
     except Exception as e:
         print(f"{_stamp()} IBKR pricing failed: {type(e).__name__}: {e}")
@@ -1188,6 +1189,10 @@ def main():
     parser.add_argument("--rejudge", action="store_true",
                         help="re-run Hermes on all picks, oldest first (no API calls)")
     parser.add_argument("--train", action="store_true", help="retrain the model (no API calls)")
+    parser.add_argument("--input-test", action="store_true",
+                        help="blind contest with vs. without the market inputs (no API calls; saves only the comparison)")
+    parser.add_argument("--daily-bars", action="store_true",
+                        help="IBKR daily bars for every recent pick ticker (normal volume for the market inputs)")
     parser.add_argument("--report", action="store_true", help="picks/model report (no API calls)")
     parser.add_argument("--test-discord", action="store_true", help="send one test message")
     parser.add_argument("--discord-history", nargs="*", metavar="YYYY-MM-DD",
@@ -1268,6 +1273,11 @@ def main():
             db = open_db()
             print(pipeline._describe(pipeline.train(db)))
             print(pipeline.report(db))
+        elif args.input_test:
+            print(pipeline._describe_input_test(pipeline.input_test(open_db())))
+        elif args.daily_bars:
+            import ibkr
+            ibkr.price_daily(open_db())
         elif args.test_discord:
             jobs = {"herald": "trade pings", "scout": "live capture and hourly updates",
                     "judges": "Hermes & Qwen accuracy", "arena": "nightly model contest",

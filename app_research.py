@@ -38,6 +38,9 @@ FEATURE_WORDS = {
     "side_buy": "Whale bought (vs sold)", "is_multileg": "Part of a spread", "leg_sold": "Sold leg of a spread",
     "flag_sweep_or_block": "Sweep or block", "flag_aggressive_execution": "Paid at the ask", "flag_algo_edge": "Algo Edge flag",
     "other_flags": "Other flags",
+    "rvol_at_print": "Stock volume vs. normal", "vol_pace_5m": "Stock volume picking up",
+    "vwap_dist_with": "Price vs. VWAP (its way)", "rsi_with": "RSI (its way)", "range_pos_with": "Spot in the day's range (its way)",
+    "flow_lean_30m_with": "Other whales agree (30 min)", "from_whale": "Whale-watch print",
 }
 
 
@@ -104,8 +107,15 @@ def learning():
     corr = json.loads(analyst[0]).get("feature_corr", {}) if analyst else {}
     inputs = [{"name": FEATURE_WORDS.get(k, k.replace("_", " ")), "key": k, "corr": v[0], "n": v[1]}
               for k, v in list(corr.items())[:10]]
+    with closing(_db()) as db:   # do the market inputs help? (pipeline.input_test, nightly)
+        it = db.execute("SELECT run_utc, inputs, n_graded, replay_days, rows, summary FROM input_tests "
+                        "ORDER BY id DESC LIMIT 1").fetchone() if db.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = 'input_tests'").fetchone() else None
+    input_test = {"run_utc": it["run_utc"], "n_graded": it["n_graded"], "replay_days": it["replay_days"],
+                  "inputs": [FEATURE_WORDS.get(k, k) for k in json.loads(it["inputs"])],
+                  "rows": json.loads(it["rows"]), "summary": json.loads(it["summary"])} if it else None
     return {"runs": runs, "board": board, "winner": run["model_kind"] if run else None, "bar": bar,
-            "replay": replay, "inputs": inputs, "strategies": strat_board,
+            "replay": replay, "inputs": inputs, "strategies": strat_board, "input_test": input_test,
             "latest": {"version": run["version"], "n": run["n_rows"], "rank": run["cv_spearman"], "hit": run["cv_hit_rate"],
                        "n_pings": run["cv_n_hit"], "base": run["base_rate_hit"], "kind": run["model_kind"],
                        "profit": run["cv_profit_avg"], "base_profit": run["base_profit_avg"],

@@ -697,6 +697,27 @@ const runTime = utc => new Date(utc).toLocaleString("en-US", { month: "short", d
 const dayShort = d => day(d).replace(/^\w+, /, "");
 
 // ---------- learning ----------
+function inputTestHTML(t) {
+  if (!t) return `<p class="muted small">The first comparison runs after the next nightly training.</p>`;
+  const s = t.summary, rank = v => v == null ? "—" : v.toFixed(2);
+  // a clear call needs two thirds of the methods to agree; anything closer is noise at this sample size
+  const verdict = s.compared === 0 ? "Not enough data to compare yet."
+    : s.better >= s.compared * 2 / 3 && (s.profit_with ?? -9) > (s.profit_without ?? -9)
+      ? `<b class="up">They help so far:</b> better for ${s.better} of ${s.compared} methods, and tonight's winner earns more with them.`
+      : s.worse >= s.compared * 2 / 3 ? `<b class="down">They don't help yet:</b> worse for ${s.worse} of ${s.compared} methods - the models may be fitting noise.`
+      : `<b>No clear difference yet</b> (better for ${s.better}, worse for ${s.worse} of ${s.compared} methods).`;
+  return `<p class="small" style="margin:0 0 10px">${verdict} Winner with them: <b>${esc(kindName(s.winner_with || ""))}</b>
+      <span class="${tone(s.profit_with)}">${pct(s.profit_with)}</span> per trade · without: <b>${esc(kindName(s.winner_without || ""))}</b>
+      <span class="${tone(s.profit_without)}">${pct(s.profit_without)}</span>.
+      <span class="muted">${t.replay_days} blind days, ${t.n_graded} graded trades - with this little data a few trades can flip it.</span></p>
+    <table class="table"><tr><th>Method</th><th class="num">With them</th><th class="num">Without</th><th class="num">Trades with / without</th>
+      <th class="num" data-tip="rank">Rank with / without</th></tr>` +
+    t.rows.map(r => `<tr><td>${esc(kindName(r.kind))}</td>
+      <td class="num ${tone(r.with)}"><b>${pct(r.with)}</b></td><td class="num ${tone(r.without)}">${pct(r.without)}</td>
+      <td class="num">${r.n_with ?? "—"} / ${r.n_without ?? "—"}</td><td class="num">${rank(r.rank_with)} / ${rank(r.rank_without)}</td></tr>`).join("") +
+    `</table>`;
+}
+
 async function loadLearning() {
   try {
     const L = await api("learning");
@@ -737,6 +758,7 @@ async function loadLearning() {
         <td class="num ${tone(s.avg_0dte)}">${pct(s.avg_0dte)}</td><td class="num ${tone(s.avg_longer)}">${pct(s.avg_longer)}</td>
         <td class="num">${s.model_picks || "—"}</td></tr>`).join("")
       : `<tr><td class="muted">Strategy results appear after the next nightly run.</td></tr>`;
+    $("#inputTest").innerHTML = inputTestHTML(L.input_test);
     draw("replayChart", { type: "bar", data: {
       labels: L.replay.map(d => dayShort(d.day)),
       datasets: [

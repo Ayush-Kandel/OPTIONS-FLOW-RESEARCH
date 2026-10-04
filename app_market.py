@@ -13,6 +13,7 @@ from contextlib import closing
 from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
 
+import tape
 from app_data import ET, _db, _market_open, _now
 
 ORDER = ["SPY", "QQQ", "NVDA", "TSLA", "META", "GOOG", "MU", "INTC", "PLTR", "CRWV", "HIMS", "DRAM"]
@@ -64,23 +65,7 @@ def _curve(session):
     for t, d, hm, v in rows:
         if "09:30" <= hm <= "15:59":
             days.setdefault((t, d), {})[hm] = v
-    share, n = {}, 0
-    for bars in days.values():
-        if len(bars) < 380:
-            continue
-        total = sum(bars.values())
-        n += 1
-        for hm, v in bars.items():
-            share[hm] = share.get(hm, 0) + v / total
-    if not n:
-        return {}
-    out, cum = {}, 0.0
-    for i in range(390):
-        hm = f"{9 + (30 + i) // 60:02d}:{(30 + i) % 60:02d}"
-        s = share.get(hm, 0) / n
-        cum += s
-        out[hm] = (s, cum)
-    return out
+    return tape.volume_curve(days.values())
 
 
 def _normal_volume(db, t, session):
@@ -122,24 +107,6 @@ def _bars(db, t, session, now_row):
         rows.append([now_row["bar_minute"], now_row["bar_open"], now_row["bar_high"], now_row["bar_low"],
                      now_row["price"], now_row["bar_volume"], now_row["bar_vwap"]])
     return rows
-
-
-def _ema(values, n):
-    k, e = 2 / (n + 1), values[0]
-    for v in values[1:]:
-        e = v * k + e * (1 - k)
-    return e
-
-
-def _rsi(closes, n=14):
-    if len(closes) <= n:
-        return None
-    gains = [max(b - a, 0) for a, b in zip(closes, closes[1:])]
-    losses = [max(a - b, 0) for a, b in zip(closes, closes[1:])]
-    g, l = sum(gains[:n]) / n, sum(losses[:n]) / n
-    for i in range(n, len(gains)):
-        g, l = (g * (n - 1) + gains[i]) / n, (l * (n - 1) + losses[i]) / n
-    return 100.0 if l == 0 else 100 - 100 / (1 + g / l)
 
 
 def _whales(db, t, session):
@@ -205,24 +172,17 @@ def _stats(db, t, session, now, now_row):
     closes = [b[4] for b in bars]
     closes[-1] = price
     vol = sum(b[5] or 0 for b in bars)
-    vw_num = sum((b[6] or (b[2] + b[3] + b[4]) / 3) * (b[5] or 0) for b in bars)
-    vwap = vw_num / vol if vol else None
+    vwap = tape.vwap(bars)
     prev = _prev_close(db, t, session)
     chg = lambda n: price / closes[-1 - n] - 1 if len(closes) > n and closes[-1 - n] else None
 
     curve = _curve(session)
-    done = [b for b in bars if b[0] < forming]
+    done = [b for b in bars if b[0] < forming]   # complete minutes only (the forming one is partial)
     normal = _normal_volume(db, t, session)
-    rvol = None
-    if normal and curve and len(done) >= 3:
-        expected = normal * curve.get(done[-1][0][11:16], (0, 0))[1]
-        rvol = sum(b[5] or 0 for b in done) / expected if expected else None
-    per_min = [(b[5] or 0) / curve[b[0][11:16]][0] for b in done if curve.get(b[0][11:16], (0,))[0]]
-    trend_vol = None
-    if len(per_min) >= 20 and sum(per_min[-20:-5]):
-        trend_vol = (sum(per_min[-5:]) / 5) / (sum(per_min[-20:-5]) / 15)
+    rvol = tape.rvol(done, curve, normal)
+    trend_vol = tape.volume_pace(done, curve)
 
-    ema9, ema21 = (_ema(closes, 9), _ema(closes, 21)) if len(closes) >= 21 else (None, None)
+    ema9, ema21 = (tape.ema(closes, 9), tape.ema(closes, 21)) if len(closes) >= 21 else (None, None)
     trend = None
     if ema9 is not None and vwap:
         trend = "up" if ema9 > ema21 and price > vwap else "down" if ema9 < ema21 and price < vwap else "mixed"
@@ -240,7 +200,7 @@ def _stats(db, t, session, now, now_row):
         "low": min(b[3] for b in bars if b[3] is not None), "volume": vol, "normal_volume": normal,
         "vwap": vwap, "vs_vwap": price / vwap - 1 if vwap else None,
         "mom": {"1m": chg(1), "5m": chg(5), "15m": chg(15), "30m": chg(30)},
-        "rsi": _rsi(closes), "trend": trend, "rvol": rvol, "vol_trend": trend_vol,
+        "rsi": tape.rsi(closes), "trend": trend, "rvol": rvol, "vol_trend": trend_vol,
         "pressure": _pressure(db, t, bars, now_row if fresh else None, forming),
         "bid": now_row["bid"] if fresh else None, "ask": now_row["ask"] if fresh else None,
         "bid_size": now_row["bid_size"] if fresh else None, "ask_size": now_row["ask_size"] if fresh else None,

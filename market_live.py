@@ -80,6 +80,44 @@ def _minute(b):
     return t.astimezone(ET).strftime("%Y-%m-%d %H:%M")
 
 
+DAILY_FIRST, DAILY_MIN = "90 D", 25    # first fetch per ticker (20 normal days before the oldest picks)
+
+
+def needs_daily(db, ticker, before):
+    """True if `ticker` lacks daily bars up to the weekday before `before` (a date), or has too few."""
+    prev = before - timedelta(days=1)
+    while prev.weekday() >= 5:
+        prev -= timedelta(days=1)
+    last, n = db.execute("SELECT MAX(trade_date), COUNT(*) FROM ib_stock_daily WHERE ticker = ? AND trade_date < ?",
+                         (ticker, before.isoformat())).fetchone()
+    return not last or last < prev.isoformat() or n < DAILY_MIN
+
+
+def fetch_daily_bars(db, ib, stocks, log=print, deadline=None):
+    """Daily TRADES bars (regular hours) for {ticker: qualified Stock}: 90 days the first time, then the
+    last 5. Today's bar only once the session is over. One paced historical request per ticker."""
+    now = datetime.now(ET)
+    cutoff = (now.date() + timedelta(days=1) if now.strftime("%H:%M") >= "16:05" else now.date()).isoformat()
+    done = 0
+    for t, s in stocks.items():
+        if deadline and time.time() > deadline:
+            log(f"daily bars: stopped at {done}/{len(stocks)} (deadline)")
+            break
+        n = db.execute("SELECT COUNT(*) FROM ib_stock_daily WHERE ticker = ?", (t,)).fetchone()[0]
+        try:
+            bars = ib.call("reqHistoricalData", s, "", DAILY_FIRST if n < DAILY_MIN else "5 D", "1 day",
+                           "TRADES", True, 1, False, [])
+        except Exception as e:
+            log(f"daily bars: {t} failed: {type(e).__name__}: {e}")
+            continue
+        db.executemany("INSERT OR REPLACE INTO ib_stock_daily VALUES (?, ?, ?, ?, ?, ?, ?)",
+                       [(t, str(b.date)[:10], b.open, b.high, b.low, b.close, b.volume) for b in bars or []
+                        if str(b.date)[:10] < cutoff])
+        db.commit()
+        done += 1
+    return done
+
+
 class MarketFeed:
     def __init__(self, db, ib, tickers, log=print):
         self.db, self.ib, self.log = db, ib, log
@@ -161,24 +199,10 @@ class MarketFeed:
         return len(self.quotes)
 
     def daily_bars(self):
-        """Once a day: the last 30 daily bars per ticker (previous close, normal daily volume)."""
-        today = datetime.now(ET).date().isoformat()
-        for t, s in self.stocks.items():
-            have = self.db.execute("SELECT MAX(trade_date), COUNT(*) FROM ib_stock_daily WHERE ticker = ? "
-                                   "AND trade_date < ?", (t, today)).fetchone()
-            prev = (datetime.now(ET).date() - timedelta(days=1)).isoformat()
-            if have[0] and have[0] >= prev and have[1] >= 20:
-                continue
-            try:
-                bars = self.ib.call("reqHistoricalData", s, "", "30 D" if have[1] < 20 else "5 D", "1 day",
-                                    "TRADES", True, 1, False, [])
-            except Exception as e:
-                self.log(f"market: {t} daily bars failed: {type(e).__name__}: {e}")
-                continue
-            rows = [(t, str(b.date)[:10], b.open, b.high, b.low, b.close, b.volume) for b in bars or []
-                    if str(b.date)[:10] < today]
-            self.db.executemany("INSERT OR REPLACE INTO ib_stock_daily VALUES (?, ?, ?, ?, ?, ?, ?)", rows)
-            self.db.commit()
+        """Once a day: daily bars up to the last session (previous close, normal daily volume)."""
+        before = datetime.now(ET).date()
+        stale = {t: s for t, s in self.stocks.items() if needs_daily(self.db, t, before)}
+        return fetch_daily_bars(self.db, self.ib, stale, log=self.log)
 
     # ---------- IBKR callbacks ----------
     def _on_error(self, req_id, code, msg, contract=None):
