@@ -10,6 +10,8 @@ session, saves the latest values for your tickers to market_now, which FlowDesk 
     this part switches itself off for the session.
   - The order book (Level 2) of the ticker open in FlowDesk: only with depth subscriptions
     (IBKR answered 2152 "Need additional market data permissions - Depth: NASDAQ ..." on Oct 3).
+  - Each options exchange's best bid and ask for the option contract open in FlowDesk (IBKR's SMART
+    depth over OPRA top-of-book: 13 exchanges on Oct 4 - the other ~4 would need depth subscriptions).
   - Once a day, 30 daily bars per ticker: the previous close and the normal daily volume.
 
 Completed minutes also go into ib_stock_bars (the same table the nightly job fills), so the
@@ -50,8 +52,14 @@ CREATE TABLE IF NOT EXISTS market_book (       -- order book of the ticker open 
     price REAL, size REAL, venue TEXT, at_utc TEXT NOT NULL,
     PRIMARY KEY (ticker, side, level)
 );
+CREATE TABLE IF NOT EXISTS option_book (       -- each exchange's quote for the option contract open in FlowDesk
+    ticker TEXT NOT NULL, strike REAL NOT NULL, put_call TEXT NOT NULL, expiration TEXT NOT NULL,
+    side TEXT NOT NULL, level INTEGER NOT NULL,
+    price REAL, size REAL, venue TEXT, at_utc TEXT NOT NULL,
+    PRIMARY KEY (side, level)
+);
 CREATE TABLE IF NOT EXISTS market_feed (       -- what the account's subscriptions allow
-    item TEXT PRIMARY KEY,         -- 'quotes', 'book', 'bars'
+    item TEXT PRIMARY KEY,         -- 'quotes', 'book', 'option_book', 'bars'
     status TEXT NOT NULL,          -- 'ok', 'not_subscribed', 'stale', 'off'
     detail TEXT, at_utc TEXT NOT NULL
 );
@@ -59,11 +67,16 @@ CREATE TABLE IF NOT EXISTS market_feed (       -- what the account's subscriptio
 
 WRITE_EVERY_SEC = 2
 BOOK_ROWS = 10
-FOCUS_URL = f"http://127.0.0.1:{os.environ.get('FLOWDESK_PORT', '8060')}/api/focus"   # ticker open in FlowDesk
+OPTION_BOOK_ROWS = 20    # SMART depth for an option = one row per exchange quoting it
+BOOK_WAIT_SEC = 15       # no levels this long after asking -> the account can't see this book
+FOCUS_URL = f"http://127.0.0.1:{os.environ.get('FLOWDESK_PORT', '8060')}/api/focus"   # what FlowDesk has open
 FOCUS_EVERY_SEC = 4
+FOCUS_MAX_AGE_SEC = 60   # FlowDesk re-sends its focus every few seconds while a page is open
 STALE_SEC = 180          # no bar update for this long in the session -> the bar stream isn't live
 NO_QUOTES = (354, 10089, 10090, 10168, 2186)
-NO_DEPTH = (2152, 10092, 309)
+# depth answers: 2152 lists which exchanges send top of book and which need depth permissions (a warning -
+# the listed "Top" exchanges still arrive); 354/10092 = nothing for this book; 309 = too many books open
+DEPTH_NOTES = (2152, 354, 10092, 309)
 
 
 def ensure_schema(db):
@@ -128,6 +141,9 @@ class MarketFeed:
         self.flow = {}           # ticker -> {minute: [buy, sell, mid]} (ticks feed)
         self.quotes_status, self.bars_status = None, None
         self.book, self.book_status, self.book_detail = None, None, None
+        self.book_since = 0.0
+        # the option contract open in FlowDesk: (key, qualified contract, depth Ticker, asked at)
+        self.obook, self.obook_status, self.obook_detail = None, None, None
         self.focus, self.focus_checked = None, 0.0
         self.last_write = 0.0
         ensure_schema(db)
@@ -210,8 +226,12 @@ class MarketFeed:
         if stock and code in NO_QUOTES and self.quotes_status != "ok":
             self.quotes_status = "not_subscribed"
             self._status("quotes", "not_subscribed", f"IBKR {code}: {msg[:300]}")
-        if code in NO_DEPTH and (stock or self.book is not None):
-            self.book_status, self.book_detail = "not_subscribed", f"IBKR {code}: {msg[:300]}"
+        if code in DEPTH_NOTES:
+            note = f"IBKR {code}: {msg[:400]}"
+            if stock:
+                self.book_detail = note
+            elif contract is not None and getattr(contract, "secType", "") == "OPT":
+                self.obook_detail = note
 
     def _on_ticks(self, tk):
         """Each trade: at/above the ask = buying, at/below the bid = selling, in between = unclear."""
@@ -230,33 +250,61 @@ class MarketFeed:
                 side = 2
             row[side] += size
 
-    # ---------- order book ----------
+    # ---------- order books (IBKR allows 3 at once: at most one stock + one option here) ----------
     def _check_focus(self):
+        """Ask FlowDesk what's on screen: a ticker page (that stock's book) and/or an option contract's
+        page (each exchange's quote for that contract)."""
         if time.time() - self.focus_checked < FOCUS_EVERY_SEC:
             return
         self.focus_checked = time.time()
         try:
             with urllib.request.urlopen(FOCUS_URL, timeout=0.5) as r:
                 f = json.loads(r.read().decode("utf-8"))
-            want = f.get("ticker") if time.time() - (f.get("at") or 0) < 60 else None
         except Exception:
-            want = None            # FlowDesk closed: no book
-        if want not in self.stocks:
-            want = None
+            f = {}                 # FlowDesk closed: no books
+        fresh = lambda key: time.time() - (f.get(key) or 0) < FOCUS_MAX_AGE_SEC
+        want = f.get("ticker") if fresh("at") else None
+        self._focus_stock(want if want in self.stocks else None)
+        c = f.get("contract") if fresh("contract_at") else None
+        self._focus_option((c["ticker"], float(c["strike"]), c["put_call"], c["expiration"]) if c else None)
+
+    def _focus_stock(self, want):
         if want == self.focus:
             return
         if self.book is not None:
-            try:
-                self.ib.call("cancelMktDepth", self.stocks[self.focus], True)
-            except Exception:
-                pass
+            self._cancel_depth(self.stocks[self.focus])
             self.book = None
         self.focus = want
         if want and self.book_status != "not_subscribed":
             self.book = self.ib.call("reqMktDepth", self.stocks[want], BOOK_ROWS, True)
-            self.book_status = "waiting"
+            self.book_status, self.book_since = "waiting", time.time()
 
-    def _write_book(self, now_utc):
+    def _focus_option(self, key):
+        if (self.obook or {}).get("key") == key:
+            return
+        if self.obook and self.obook["contract"] is not None:
+            self._cancel_depth(self.obook["contract"])
+        self.obook = None
+        if not key:
+            return
+        from ibkr import _option
+        c = _option(key[0], key[3], key[1], key[2])
+        if self.ib.call("qualifyContracts", c) and c.conId:
+            self.obook = {"key": key, "contract": c, "since": time.time(),
+                          "ticker": self.ib.call("reqMktDepth", c, OPTION_BOOK_ROWS, True)}
+            self.obook_status, self.obook_detail = "waiting", None
+        else:   # remembered, so it isn't looked up again every few seconds
+            self.obook = {"key": key, "contract": None, "ticker": None, "since": time.time()}
+            self.obook_status, self.obook_detail = "no_contract", "IBKR doesn't list this contract (expired?)"
+
+    def _cancel_depth(self, contract):
+        try:
+            self.ib.call("cancelMktDepth", contract, True)
+        except Exception:
+            pass
+
+    def _write_books(self, now_utc):
+        # the stock's book: none arriving within BOOK_WAIT_SEC = not visible with this account's data
         self.db.execute("DELETE FROM market_book")
         if self.book is not None and self.focus:
             rows = [(self.focus, side, i, _num(lv.price), _num(lv.size), lv.marketMaker or "", now_utc)
@@ -265,9 +313,29 @@ class MarketFeed:
             self.db.executemany("INSERT INTO market_book VALUES (?, ?, ?, ?, ?, ?, ?)", rows)
             if rows:
                 self.book_status = "ok"
+            elif time.time() - self.book_since > BOOK_WAIT_SEC:
+                self.book_status = "not_subscribed"           # stop asking for this connection and free the slot
+                self._cancel_depth(self.stocks[self.focus])
+                self.book = None
         if self.book_status in ("ok", "not_subscribed"):
             self._status("book", self.book_status, self.book_detail if self.book_status != "ok" else self.focus,
                          commit=False)
+        # each exchange's quote for the option contract (kept open: quotes can appear later, e.g. at the open)
+        self.db.execute("DELETE FROM option_book")
+        ob = self.obook
+        if ob and ob["ticker"] is not None:
+            rows = [(*ob["key"], side, i, _num(lv.price), _num(lv.size), lv.marketMaker or "", now_utc)
+                    for side, levels in (("bid", ob["ticker"].domBids), ("ask", ob["ticker"].domAsks))
+                    for i, lv in enumerate(levels[:OPTION_BOOK_ROWS])]
+            self.db.executemany("INSERT INTO option_book VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
+            if rows:
+                self.obook_status = "ok"
+            elif time.time() - ob["since"] > BOOK_WAIT_SEC:
+                self.obook_status = "no_quotes"
+        if ob:
+            detail = (f"{len(set(r[8] for r in rows))} exchanges quoting" if ob["ticker"] is not None and rows
+                      else self.obook_detail)
+            self._status("option_book", self.obook_status, detail, commit=False)
 
     # ---------- every few seconds ----------
     def snapshot(self, force=False):
@@ -317,7 +385,7 @@ class MarketFeed:
                                 [(t, m, *v) for m, v in flow.items()])
             for m in [m for m in flow if m < forming]:   # finished minutes are saved; keep only the current one
                 del flow[m]
-        self._write_book(now_utc)
+        self._write_books(now_utc)
         status = "stale" if self.bars and stale == len(self.bars) else "ok" if self.bars else None
         if status and status != self.bars_status:
             self.bars_status = status
@@ -344,8 +412,7 @@ class MarketFeed:
             except Exception:
                 pass
         if self.book is not None and self.focus:
-            try:
-                self.ib.call("cancelMktDepth", self.stocks[self.focus], True)
-            except Exception:
-                pass
-        self.bars, self.book = {}, None
+            self._cancel_depth(self.stocks[self.focus])
+        if self.obook and self.obook["contract"] is not None:
+            self._cancel_depth(self.obook["contract"])
+        self.bars, self.book, self.obook = {}, None, None

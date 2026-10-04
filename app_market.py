@@ -21,7 +21,7 @@ FRESH_SEC = 20            # market_now older than this isn't "live"
 BIG_WHALE = 350_000
 MARKER_MIN = 250_000      # whale prints drawn on the chart
 SPARK_POINTS = 78
-FOCUS = {"ticker": None, "at": 0.0}
+FOCUS = {"ticker": None, "at": 0.0, "contract": None, "contract_at": 0.0}   # what's open on screen
 
 
 def tickers():
@@ -318,3 +318,47 @@ def ticker(t):
 
 def focus():
     return dict(FOCUS)
+
+
+# IBKR's exchange codes -> the names traders use
+EXCHANGES = {"CBOE": "Cboe", "CBOE2": "Cboe C2", "BATS": "Cboe BZX", "EDGX": "Cboe EDGX", "PHLX": "Nasdaq PHLX",
+             "NASDAQBX": "Nasdaq BX", "NASDAQOM": "Nasdaq NOM", "ISE": "Nasdaq ISE", "GEMINI": "Nasdaq GEMX",
+             "MERCURY": "Nasdaq MRX", "BOX": "BOX", "MIAX": "MIAX", "PEARL": "MIAX Pearl", "EMERALD": "MIAX Emerald",
+             "SAPPHIRE": "MIAX Sapphire", "MEMX": "MEMX", "AMEX": "NYSE American", "PSE": "NYSE Arca"}
+
+
+def option_book(pick_id):
+    """Each options exchange's best bid and ask (with size) for a pick's contract, as the IBKR tracker
+    streams it for the contract open in FlowDesk. Asking keeps that contract in focus."""
+    with closing(_db()) as db:
+        p = db.execute("SELECT ticker, strike, put_call, expiration FROM picks WHERE id = ?", (pick_id,)).fetchone()
+        if not p:
+            return None
+        key = (p["ticker"], p["strike"], p["put_call"], p["expiration"])
+        FOCUS.update(contract=dict(zip(("ticker", "strike", "put_call", "expiration"), key)), contract_at=time.time())
+        feed = _feed(db).get("option_book")
+        rows = db.execute("SELECT side, price, size, venue, at_utc FROM option_book WHERE ticker = ? AND strike = ? "
+                          "AND put_call = ? AND expiration = ?", key).fetchall() if _has(db, "option_book") else []
+    venues = {}
+    for r in rows:
+        if _age(r["at_utc"]) >= FRESH_SEC or not r["price"] or r["price"] <= 0:
+            continue
+        v = venues.setdefault(r["venue"] or "?", {"venue": r["venue"], "name": EXCHANGES.get(r["venue"], r["venue"]),
+                                                   "bid": None, "bid_size": None, "ask": None, "ask_size": None})
+        side = r["side"]
+        better = v[side] is None or (r["price"] > v[side] if side == "bid" else r["price"] < v[side])
+        if better:
+            v[side], v[side + "_size"] = r["price"], r["size"]
+    bids = [v["bid"] for v in venues.values() if v["bid"] is not None]
+    asks = [v["ask"] for v in venues.values() if v["ask"] is not None]
+    best_bid, best_ask = (max(bids) if bids else None), (min(asks) if asks else None)
+    at = lambda side, best: [v for v in venues.values() if best is not None and v[side] == best]
+    return {
+        "status": "ok" if venues else (feed["status"] if feed else None), "detail": feed["detail"] if feed else None,
+        "market_open": _market_open(_now()),
+        "venues": sorted(venues.values(), key=lambda v: (-(v["bid"] or 0), v["ask"] or 1e9)),
+        "best_bid": best_bid, "best_ask": best_ask,
+        "n_at_bid": len(at("bid", best_bid)), "n_at_ask": len(at("ask", best_ask)),
+        "size_at_bid": sum(v["bid_size"] or 0 for v in at("bid", best_bid)),
+        "size_at_ask": sum(v["ask_size"] or 0 for v in at("ask", best_ask)),
+    }
